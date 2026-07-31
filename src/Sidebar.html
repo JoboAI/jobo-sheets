@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      /* @inline:tokens.css */
+      /* @inline:combobox.css */
+
+      /*
+       * Dense 300px single-column variant of the render style guide: 13px
+       * body, 36px inputs, hairline-divided sections, mono eyebrow section
+       * labels (the only uppercase text). Square everywhere — only the
+       * spinner is round.
+       */
+      body {
+        font-family: var(--jobo-font-sans);
+        font-size: 13px;
+        color: var(--jobo-ink-800);
+        background: #fff;
+        margin: 0;
+        padding: 16px 14px;
+      }
+      h2 {
+        font-family: var(--jobo-font-sans);
+        font-size: 15px;
+        font-weight: 500;
+        letter-spacing: -0.01em;
+        color: var(--jobo-ink-900);
+        margin: 0 0 4px;
+      }
+      .eyebrow {
+        font-family: var(--jobo-font-mono);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--jobo-ink-600);
+        margin: 0 0 6px;
+      }
+      p.hint {
+        color: var(--jobo-ink-600);
+        font-size: 12px;
+        margin: 0 0 14px;
+        line-height: 1.45;
+      }
+      a {
+        color: var(--jobo-brand);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      label {
+        display: block;
+        font-weight: 500;
+        font-size: 12px;
+        color: var(--jobo-ink-900);
+        margin: 12px 0 4px;
+      }
+      /* .jobo-cb-input is styled by the combobox (borderless inside its field) */
+      input[type="text"]:not(.jobo-cb-input),
+      input[type="password"],
+      input[type="number"],
+      input[type="date"] {
+        width: 100%;
+        box-sizing: border-box;
+        height: 36px;
+        padding: 0 10px;
+        border: 1px solid var(--jobo-ink-300);
+        border-radius: 0;
+        background: #fff;
+        font-family: inherit;
+        font-size: 13px;
+        color: var(--jobo-ink-800);
+        transition: border-color var(--jobo-transition);
+      }
+      input[type="number"] {
+        font-variant-numeric: tabular-nums;
+      }
+      input:not(.jobo-cb-input):hover {
+        border-color: var(--jobo-ink-500);
+      }
+      input:not(.jobo-cb-input):focus {
+        outline: none;
+        border-color: var(--jobo-ring);
+        box-shadow: 0 0 0 1px var(--jobo-ring);
+      }
+      input::placeholder {
+        color: var(--jobo-ink-400);
+      }
+      .checks {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+      }
+      .checks label {
+        font-weight: 400;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--jobo-ink-800);
+      }
+      .checks input[type="checkbox"] {
+        appearance: none;
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        border: 1px solid var(--jobo-ink-300);
+        border-radius: 0;
+        background: #fff;
+        cursor: pointer;
+        display: inline-grid;
+        place-content: center;
+        transition: border-color var(--jobo-transition), background-color var(--jobo-transition);
+      }
+      .checks input[type="checkbox"]:checked {
+        background: var(--jobo-ink-950);
+        border-color: var(--jobo-ink-950);
+      }
+      .checks input[type="checkbox"]:checked::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        background: #fff;
+        clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+      }
+      .checks input[type="checkbox"]:focus-visible {
+        outline: 2px solid var(--jobo-ring);
+        outline-offset: 1px;
+      }
+      button.primary {
+        width: 100%;
+        background: var(--jobo-ink-950);
+        color: #fff;
+        border: 1px solid var(--jobo-ink-950);
+        border-radius: 0;
+        padding: 9px 14px;
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        margin-top: 16px;
+        transition: background-color var(--jobo-transition), border-color var(--jobo-transition);
+      }
+      button.primary:hover {
+        background: var(--jobo-brand);
+        border-color: var(--jobo-brand);
+      }
+      button.primary:active {
+        background: var(--jobo-brand-deep);
+        border-color: var(--jobo-brand-deep);
+      }
+      button.primary:disabled {
+        background: var(--jobo-ink-100);
+        border-color: var(--jobo-ink-200);
+        color: var(--jobo-ink-400);
+        cursor: default;
+      }
+      button.primary:focus-visible,
+      button.link:focus-visible {
+        outline: 2px solid var(--jobo-ring);
+        outline-offset: 2px;
+      }
+      button.link {
+        background: none;
+        border: 0;
+        color: var(--jobo-brand);
+        padding: 0;
+        margin: 8px 0 0;
+        font-family: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button.link:hover {
+        text-decoration: underline;
+      }
+      details {
+        margin-top: 14px;
+        border-top: 1px solid var(--jobo-ink-200);
+        padding-top: 10px;
+      }
+      details summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--jobo-ink-700);
+        list-style: none;
+      }
+      details summary::before {
+        content: "+";
+        display: inline-block;
+        width: 12px;
+        color: var(--jobo-ink-500);
+      }
+      details[open] summary::before {
+        content: "−";
+      }
+      .status {
+        margin-top: 12px;
+        padding: 8px 10px;
+        border-radius: 0;
+        font-size: 12px;
+        line-height: 1.45;
+        display: none;
+      }
+      .status.ok {
+        display: block;
+        background: var(--jobo-success-tint);
+        color: var(--jobo-success-fg);
+      }
+      .status.err {
+        display: block;
+        background: var(--jobo-critical-tint);
+        color: var(--jobo-critical-fg);
+      }
+      .status .credits {
+        font-variant-numeric: tabular-nums;
+      }
+      .spinner {
+        display: none;
+        width: 14px;
+        height: 14px;
+        margin: 12px auto 0;
+        border: 2px solid var(--jobo-ink-200);
+        border-top-color: var(--jobo-ink-700);
+        border-radius: 9999px; /* the one allowed rounded element */
+        animation: jobo-spin 0.7s linear infinite;
+      }
+      .spinner.on {
+        display: block;
+      }
+      @keyframes jobo-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      hr {
+        border: 0;
+        border-top: 1px solid var(--jobo-ink-200);
+        margin: 16px 0 12px;
+      }
+      .section {
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid var(--jobo-ink-200);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="setup" style="display: none">
+      <p class="eyebrow">Connection</p>
+      <h2>Connect to Jobo</h2>
+      <p class="hint">
+        Paste your API key. Get one at
+        <a href="https://enterprise.jobo.world/api-keys" target="_blank" rel="noopener">enterprise.jobo.world</a>.
+      </p>
+      <label for="apiKey">API key</label>
+      <input type="password" id="apiKey" placeholder="jbe_live_…" autocomplete="off" />
+      <button class="primary" id="saveKey">Save key</button>
+      <div class="status" id="setupStatus"></div>
+    </div>
+
+    <div id="main" style="display: none">
+      <p class="eyebrow">Import</p>
+      <h2>Import jobs</h2>
+      <p class="hint">
+        Results are written to a new sheet. You are billed per job imported, so narrow the filters
+        to keep the cost down.
+      </p>
+
+      <label for="q">Search</label>
+      <input type="text" id="q" placeholder="e.g. rust engineer" />
+
+      <label id="locationLabel">Location</label>
+      <div id="location"></div>
+
+      <label id="sourcesLabel">Sources</label>
+      <div id="sources"></div>
+
+      <label id="skillsLabel">Skills</label>
+      <div id="skills"></div>
+
+      <label id="industriesLabel">Industries</label>
+      <div id="industries"></div>
+
+      <label>Work model</label>
+      <div class="checks" id="workModels"></div>
+
+      <label>Employment type</label>
+      <div class="checks" id="employmentTypes"></div>
+
+      <label>Experience level</label>
+      <div class="checks" id="experienceLevels"></div>
+
+      <label for="minSalary">Minimum salary (USD)</label>
+      <input type="number" id="minSalary" min="0" step="1000" placeholder="Only matches published ranges" />
+
+      <label for="maxSalary">Maximum salary (USD)</label>
+      <input type="number" id="maxSalary" min="0" step="1000" placeholder="Optional ceiling" />
+
+      <details>
+        <summary> More filters</summary>
+        <label for="postedAfter">Posted after</label>
+        <input type="date" id="postedAfter" />
+        <label class="checks" style="margin-top: 10px">
+          <input type="checkbox" id="searchDescriptions" checked />
+          Search descriptions as well as titles
+        </label>
+      </details>
+
+      <label for="limit">How many jobs</label>
+      <input type="number" id="limit" min="1" max="1000" value="100" />
+
+      <button class="primary" id="run">Import</button>
+      <div class="spinner" id="spinner"></div>
+      <div class="status" id="status"></div>
+
+      <hr />
+      <button class="link" id="changeKey">Use a different API key</button>
+    </div>
+
+    <script>
+      // @inline:combobox.js
+    </script>
+    <script>
+      var STATE = null;
+      var locationBox = null;
+      var sourcesBox = null;
+      var skillsBox = null;
+      var industriesBox = null;
+
+      function el(id) { return document.getElementById(id); }
+
+      function serverCall(fn) {
+        var args = Array.prototype.slice.call(arguments, 1);
+        return new Promise(function (resolve, reject) {
+          var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
+          runner[fn].apply(runner, args);
+        });
+      }
+
+      function setStatus(message, ok) {
+        var box = el('status');
+        box.textContent = message;
+        box.className = ok ? 'status ok' : 'status err';
+      }
+
+      function toItems(keys) {
+        return keys.map(function (key) { return { label: key, value: key }; });
+      }
+
+      /** Client-side substring filter over a preloaded list — a per-keystroke
+       *  google.script.run round trip (~1s) is far too slow for typeahead, so
+       *  only Location (Photon suggest) goes to the server. */
+      function localFilter(list) {
+        return function (query) {
+          var q = query.toLowerCase();
+          var matches = list.filter(function (key) { return key.toLowerCase().indexOf(q) !== -1; });
+          return Promise.resolve(toItems(matches.slice(0, 12)));
+        };
+      }
+
+      function suggestLocationItems(query) {
+        return serverCall('suggestLocations', query).then(function (result) {
+          return (result.suggestions || [])
+            .map(function (s) {
+              var label = s.display_name || [s.city, s.region, s.country].filter(Boolean).join(', ');
+              return label ? { label: label, value: label } : null;
+            })
+            .filter(Boolean);
+        });
+      }
+
+      function mountFilterBoxes() {
+        locationBox = createJoboCombobox(el('location'), {
+          fetchSuggestions: suggestLocationItems,
+          placeholder: 'e.g. Berlin, Germany',
+          ariaLabel: 'Location',
+          dense: true
+        });
+
+        // Until the dynamic options arrive, sources/industries accept free
+        // text so the form never blocks on the API.
+        sourcesBox = createJoboCombobox(el('sources'), {
+          multi: true,
+          allowFreeText: true,
+          placeholder: 'e.g. greenhouse, lever_co',
+          ariaLabel: 'Sources',
+          dense: true
+        });
+        industriesBox = createJoboCombobox(el('industries'), {
+          multi: true,
+          allowFreeText: true,
+          placeholder: 'e.g. fintech',
+          ariaLabel: 'Industries',
+          dense: true
+        });
+        skillsBox = createJoboCombobox(el('skills'), {
+          multi: true,
+          allowFreeText: true,
+          placeholder: 'e.g. Python — press Enter to add',
+          ariaLabel: 'Skills',
+          dense: true
+        });
+
+        serverCall('getFilterOptions').then(function (options) {
+          if (!options || !options.ok) return; // keep free-text fallback
+          if (options.sources.length > 0) {
+            sourcesBox.destroy();
+            sourcesBox = createJoboCombobox(el('sources'), {
+              multi: true,
+              fetchSuggestions: localFilter(options.sources),
+              placeholder: 'Start typing to see sources',
+              ariaLabel: 'Sources',
+              minChars: 1,
+              dense: true
+            });
+          }
+          if (options.industries.length > 0) {
+            industriesBox.destroy();
+            industriesBox = createJoboCombobox(el('industries'), {
+              multi: true,
+              fetchSuggestions: localFilter(options.industries),
+              placeholder: 'Start typing to see industries',
+              ariaLabel: 'Industries',
+              minChars: 1,
+              dense: true
+            });
+          }
+        }).catch(function () { /* fallback stays */ });
+      }
+
+      function renderChecks(containerId, values) {
+        var container = el(containerId);
+        container.innerHTML = '';
+        values.forEach(function (value) {
+          var label = document.createElement('label');
+          var input = document.createElement('input');
+          input.type = 'checkbox';
+          input.value = value;
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(value));
+          container.appendChild(label);
+        });
+      }
+
+      function checked(containerId) {
+        var boxes = el(containerId).querySelectorAll('input:checked');
+        return Array.prototype.map.call(boxes, function (b) { return b.value; });
+      }
+
+      function chipValues(box) {
+        return box.getValues().map(function (v) { return v.value; });
+      }
+
+      /** Chip if picked, otherwise whatever is typed — free text is valid. */
+      function locationValue() {
+        var values = chipValues(locationBox);
+        if (values.length > 0) return values[0];
+        var input = el('location').querySelector('input');
+        return input ? input.value.trim() : '';
+      }
+
+      function show(settings) {
+        STATE = settings;
+        el('setup').style.display = settings.hasKey ? 'none' : 'block';
+        el('main').style.display = settings.hasKey ? 'block' : 'none';
+        if (settings.hasKey) {
+          renderChecks('workModels', settings.workModels);
+          renderChecks('employmentTypes', settings.employmentTypes);
+          renderChecks('experienceLevels', settings.experienceLevels);
+          mountFilterBoxes();
+        }
+      }
+
+      el('saveKey').addEventListener('click', function () {
+        var button = this;
+        button.disabled = true;
+        serverCall('saveApiKey', el('apiKey').value)
+          .then(function (result) {
+            button.disabled = false;
+            if (result.ok) {
+              serverCall('getSettings').then(show);
+            } else {
+              var box = el('setupStatus');
+              box.textContent = result.message;
+              box.className = 'status err';
+            }
+          })
+          .catch(function (err) {
+            button.disabled = false;
+            var box = el('setupStatus');
+            box.textContent = err.message;
+            box.className = 'status err';
+          });
+      });
+
+      el('changeKey').addEventListener('click', function () {
+        serverCall('clearApiKey').then(function () {
+          serverCall('getSettings').then(show);
+        });
+      });
+
+      el('run').addEventListener('click', function () {
+        var button = this;
+        button.disabled = true;
+        el('spinner').className = 'spinner on';
+        setStatus('', true);
+        el('status').className = 'status';
+
+        serverCall('importJobs', {
+          q: el('q').value,
+          location: locationValue(),
+          sources: chipValues(sourcesBox),
+          skills: chipValues(skillsBox),
+          industries: chipValues(industriesBox),
+          workModels: checked('workModels'),
+          employmentTypes: checked('employmentTypes'),
+          experienceLevels: checked('experienceLevels'),
+          minSalaryUsd: Number(el('minSalary').value || 0),
+          maxSalaryUsd: Number(el('maxSalary').value || 0),
+          postedAfter: el('postedAfter').value || '',
+          searchDescriptions: el('searchDescriptions').checked,
+          limit: Number(el('limit').value || 100)
+        })
+          .then(function (result) {
+            button.disabled = false;
+            el('spinner').className = 'spinner';
+            setStatus(result.message, result.ok);
+          })
+          .catch(function (err) {
+            button.disabled = false;
+            el('spinner').className = 'spinner';
+            setStatus(err.message, false);
+          });
+      });
+
+      serverCall('getSettings').then(show);
+    </script>
+  </body>
+</html>

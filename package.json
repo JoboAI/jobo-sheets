@@ -1,0 +1,22 @@
+{
+  "name": "jobo-sheets",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Google Sheets add-on that imports filtered Jobo job data into the active spreadsheet.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist-test/*.test.js",
+    "push": "npm run build && npx --yes @google/clasp push"
+  },
+  "license": "MIT",
+  "author": "Jobo <support@jobo.world>",
+  "devDependencies": {
+    "@jobo-ai/connector-core": "0.1.0",
+    "@types/google-apps-script": "^1.0.83",
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.3"
+  }
+}
