@@ -195,7 +195,7 @@ function onHomepage(): unknown {
 }
 
 function showSidebar(): void {
-  const html = HtmlService.createHtmlOutputFromFile("Sidebar").setTitle("Jobo Jobs");
+  const html = HtmlService.createHtmlOutputFromFile("Sidebar").setTitle("Career Site Jobs");
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
