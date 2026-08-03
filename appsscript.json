@@ -9,7 +9,7 @@
   ],
   "addOns": {
     "common": {
-      "name": "Career Site Jobs \u2013 Jobo",
+      "name": "Career Site Jobs – Jobo",
       "logoUrl": "https://jobo.world/logo-96.png",
       "homepageTrigger": {
         "runFunction": "onHomepage",
