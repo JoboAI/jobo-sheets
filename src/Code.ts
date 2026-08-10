@@ -159,7 +159,7 @@ export function describeFailure(status: number, body: unknown): string {
       : null;
 
   if (status === 402) {
-    return `Your Jobo credit balance is too low for this import. ${detail ?? ""} Top up at enterprise.jobo.world, or import fewer jobs.`.trim();
+    return `Your Jobo wallet balance is too low for this import. ${detail ?? ""} Top up your wallet at enterprise.jobo.world, or import fewer jobs.`.trim();
   }
   if (status === 401 || status === 403) {
     return "Jobo rejected the API key. Check it is current at enterprise.jobo.world/api-keys.";
@@ -420,12 +420,12 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
 
     writeSheet(jobs);
 
-    const cost = creditsSpent > 0 ? ` Cost: ${creditsSpent} credits` : "";
-    const left = balance != null ? `, ${balance} remaining.` : ".";
-    const allowance = quotaRemaining != null
-      ? ` Shared allowance: ${quotaRemaining}${quotaLimit != null ? ` of ${quotaLimit}` : ""} jobs remaining.`
+    const cost = creditsSpent > 0 ? ` Cost: $${(creditsSpent / 1000).toFixed(2)} (${creditsSpent} credits).` : "";
+    const left = balance != null ? ` Wallet balance: $${(balance / 1000).toFixed(2)}.` : "";
+    const included = quotaRemaining != null
+      ? ` Included jobs: ${quotaRemaining}${quotaLimit != null ? ` of ${quotaLimit}` : ""} remaining.`
       : "";
-    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${allowance}` };
+    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${included}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };
   }

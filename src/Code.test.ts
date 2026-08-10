@@ -71,7 +71,7 @@ describe("retry policy", () => {
 describe("failure messages", () => {
   it("tells the user what to do about an empty wallet", () => {
     const message = describeFailure(402, { detail: "Balance too low." });
-    assert.match(message, /credit balance/i);
+    assert.match(message, /wallet balance/i);
     assert.match(message, /enterprise\.jobo\.world/);
   });
 
