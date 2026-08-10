@@ -64,6 +64,8 @@ export interface ApiResult {
   body: unknown;
   creditsDeducted: number | null;
   creditsBalance: number | null;
+  quotaLimit: number | null;
+  quotaRemaining: number | null;
   retryAfterSeconds: number | null;
 }
 
@@ -131,6 +133,8 @@ function request(path: string, apiKey: string): ApiResult {
       body,
       creditsDeducted: readNumber(headers, "x-credits-deducted"),
       creditsBalance: readNumber(headers, "x-credits-balance"),
+      quotaLimit: readNumber(headers, "x-quota-limit"),
+      quotaRemaining: readNumber(headers, "x-quota-remaining"),
       retryAfterSeconds: readNumber(headers, "retry-after"),
     };
 
@@ -370,6 +374,8 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
     let page = 1;
     let creditsSpent = 0;
     let balance: number | null = null;
+    let quotaLimit: number | null = null;
+    let quotaRemaining: number | null = null;
 
     while (jobs.length < limit) {
       const path =
@@ -399,6 +405,8 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
 
       creditsSpent += result.creditsDeducted ?? 0;
       balance = result.creditsBalance ?? balance;
+      quotaLimit = result.quotaLimit ?? quotaLimit;
+      quotaRemaining = result.quotaRemaining ?? quotaRemaining;
 
       const data = result.body as { jobs?: Job[]; total_pages?: number };
       const batch = data.jobs ?? [];
@@ -414,7 +422,10 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
 
     const cost = creditsSpent > 0 ? ` Cost: ${creditsSpent} credits` : "";
     const left = balance != null ? `, ${balance} remaining.` : ".";
-    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}` };
+    const allowance = quotaRemaining != null
+      ? ` Shared allowance: ${quotaRemaining}${quotaLimit != null ? ` of ${quotaLimit}` : ""} jobs remaining.`
+      : "";
+    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${allowance}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };
   }
