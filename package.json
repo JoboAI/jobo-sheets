@@ -13,7 +13,7 @@
   "license": "MIT",
   "author": "Jobo <support@jobo.world>",
   "devDependencies": {
-    "@jobo-ai/connector-core": "0.2.0",
+    "@jobo-ai/connector-core": "0.3.0",
     "@types/google-apps-script": "^1.0.83",
     "@types/node": "^20.11.0",
     "esbuild": "^0.20.0",

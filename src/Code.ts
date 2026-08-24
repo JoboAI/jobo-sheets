@@ -101,7 +101,9 @@ function request(path: string, apiKey: string): ApiResult {
     // is lost, so nothing could be mapped to a useful message.
     const response = UrlFetchApp.fetch(`${BASE_URL}${path}`, {
       method: "get",
-      headers: { "X-Api-Key": apiKey, Accept: "application/json" },
+      // X-Jobo-Client is how the API attributes this traffic to the add-on;
+      // Apps Script owns the User-Agent and will not let us set one.
+      headers: { "X-Api-Key": apiKey, Accept: "application/json", "X-Jobo-Client": "sheets" },
       muteHttpExceptions: true,
     });
 
