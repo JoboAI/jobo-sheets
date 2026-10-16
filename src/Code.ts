@@ -52,6 +52,15 @@ const COLUMNS: Array<{ header: string; value: (job: Job) => string | number }> =
   { header: "Job ID", value: (j) => j.id },
 ];
 
+/**
+ * setValues() runs any string starting with "=" as a formula, and job titles are
+ * scraped from pages anyone can post on (=HYPERLINK, =IMPORTDATA…). A leading
+ * apostrophe makes Sheets keep the cell as text; numbers pass through untouched.
+ */
+export function neutralizeFormula(value: string | number): string | number {
+  return typeof value === "string" && /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+}
+
 export function formatLocation(job: Job): string {
   const first = job.locations?.[0];
   if (!first) return job.workplace_type === "Remote" ? "Remote" : "";
@@ -438,7 +447,7 @@ function writeSheet(jobs: Job[]): void {
   const sheet = spreadsheet.insertSheet(uniqueSheetName(spreadsheet, "Jobo Jobs"));
 
   const rows: Array<Array<string | number>> = [COLUMNS.map((c) => c.header)];
-  for (const job of jobs) rows.push(COLUMNS.map((c) => c.value(job)));
+  for (const job of jobs) rows.push(COLUMNS.map((c) => neutralizeFormula(c.value(job))));
 
   sheet.getRange(1, 1, rows.length, COLUMNS.length).setValues(rows);
   sheet.getRange(1, 1, 1, COLUMNS.length).setFontWeight("bold");

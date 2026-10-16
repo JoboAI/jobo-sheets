@@ -7,6 +7,7 @@ import {
   describeFailure,
   formatLocation,
   isRetryableStatus,
+  neutralizeFormula,
   uniqueSheetName,
 } from "./Code.js";
 import { JOB_SEARCH_FILTERS, type Job } from "@jobo-ai/connector-core";
@@ -173,5 +174,23 @@ describe("sheet naming", () => {
     const taken = new Set(["Jobo Jobs", "Jobo Jobs 2"]);
     const sheet = { getSheetByName: (name: string) => (taken.has(name) ? {} : null) };
     assert.equal(uniqueSheetName(sheet, "Jobo Jobs"), "Jobo Jobs 3");
+  });
+});
+
+describe("neutralizeFormula", () => {
+  it("prefixes text that Sheets would run as a formula", () => {
+    assert.equal(neutralizeFormula('=HYPERLINK("https://evil.test","Apply")'), `'=HYPERLINK("https://evil.test","Apply")`);
+    assert.equal(neutralizeFormula("=IMPORTDATA(A1)"), "'=IMPORTDATA(A1)");
+    assert.equal(neutralizeFormula("+1 555 0100"), "'+1 555 0100");
+    assert.equal(neutralizeFormula("-x"), "'-x");
+    assert.equal(neutralizeFormula("@SUM(A1)"), "'@SUM(A1)");
+    assert.equal(neutralizeFormula("\t=1"), "'\t=1");
+  });
+
+  it("leaves ordinary text and numbers alone", () => {
+    assert.equal(neutralizeFormula("Engineer = great"), "Engineer = great");
+    assert.equal(neutralizeFormula(""), "");
+    assert.equal(neutralizeFormula(-5), -5);
+    assert.equal(neutralizeFormula(120000), 120000);
   });
 });
