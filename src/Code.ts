@@ -376,7 +376,13 @@ interface ImportRequest {
   limit?: number;
 }
 
-function importJobs(req: ImportRequest): { ok: boolean; message: string } {
+/**
+ * Every page is billed as it is delivered, so a failure on a later page (a 402
+ * once the wallet runs dry, or a 429/5xx that outlasted the retries) must not
+ * throw away the pages already fetched: they are written, and the message says
+ * how far the import got and why it stopped.
+ */
+export function importJobs(req: ImportRequest): { ok: boolean; message: string } {
   try {
     const key = apiKey();
     const limit = Math.min(Math.max(req.limit ?? 100, 1), 1000);
@@ -387,6 +393,7 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
     let balance: number | null = null;
     let quotaLimit: number | null = null;
     let quotaRemaining: number | null = null;
+    let failure: string | null = null;
 
     while (jobs.length < limit) {
       const path =
@@ -409,9 +416,18 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
           page_size: Math.min(100, limit - jobs.length),
         });
 
-      const result = request(path, key);
+      // UrlFetchApp throws on network faults even with muteHttpExceptions, so a
+      // thrown page stops the loop the same way a failed status does.
+      let result: ApiResult;
+      try {
+        result = request(path, key);
+      } catch (err) {
+        failure = (err as Error).message;
+        break;
+      }
       if (result.status < 200 || result.status >= 300) {
-        return { ok: false, message: describeFailure(result.status, result.body) };
+        failure = describeFailure(result.status, result.body);
+        break;
       }
 
       creditsSpent += result.creditsDeducted ?? 0;
@@ -427,7 +443,11 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
       page++;
     }
 
-    if (jobs.length === 0) return { ok: true, message: "No jobs matched those filters." };
+    if (jobs.length === 0) {
+      return failure != null
+        ? { ok: false, message: failure }
+        : { ok: true, message: "No jobs matched those filters." };
+    }
 
     writeSheet(jobs);
 
@@ -436,6 +456,12 @@ function importJobs(req: ImportRequest): { ok: boolean; message: string } {
     const included = quotaRemaining != null
       ? ` Included jobs: ${quotaRemaining}${quotaLimit != null ? ` of ${quotaLimit}` : ""} remaining.`
       : "";
+    if (failure != null) {
+      return {
+        ok: false,
+        message: `Imported ${jobs.length} of the ${limit} jobs requested before the import stopped. ${failure}${cost}${left}${included}`,
+      };
+    }
     return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${included}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };

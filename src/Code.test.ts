@@ -6,6 +6,7 @@ import {
   buildQuery,
   describeFailure,
   formatLocation,
+  importJobs,
   isRetryableStatus,
   neutralizeFormula,
   uniqueSheetName,
@@ -41,6 +42,131 @@ function job(overrides: Partial<Job> = {}): Job {
     ...overrides,
   };
 }
+
+function jobs(count: number, offset = 0): Job[] {
+  return Array.from({ length: count }, (_, n) => job({ id: `job-${offset + n}`, title: `Job ${offset + n}` }));
+}
+
+interface FakeResponse {
+  status: number;
+  body?: unknown;
+  headers?: Record<string, string>;
+}
+
+/**
+ * Just enough of the Apps Script runtime for importJobs: a saved key, a
+ * scripted UrlFetchApp (an Error entry is thrown, like a network fault), and a
+ * spreadsheet that records what was written.
+ */
+function installAppsScript(responses: Array<FakeResponse | Error>): { urls: string[]; written: unknown[][][] } {
+  const urls: string[] = [];
+  const written: unknown[][][] = [];
+  const g = globalThis as unknown as Record<string, unknown>;
+
+  g.PropertiesService = { getUserProperties: () => ({ getProperty: () => "jbe_test_key" }) };
+  g.Utilities = { sleep: () => undefined };
+  g.UrlFetchApp = {
+    fetch: (url: string) => {
+      urls.push(url);
+      const next = responses.shift();
+      if (!next) throw new Error(`unexpected request ${url}`);
+      if (next instanceof Error) throw next;
+      return {
+        getResponseCode: () => next.status,
+        getContentText: () => (next.body === undefined ? "" : JSON.stringify(next.body)),
+        getAllHeaders: () => next.headers ?? {},
+      };
+    },
+  };
+  g.SpreadsheetApp = {
+    getActiveSpreadsheet: () => ({
+      getSheetByName: () => null,
+      insertSheet: () => ({
+        getRange: () => ({
+          setValues: (rows: unknown[][]) => written.push(rows),
+          setFontWeight: () => undefined,
+        }),
+        setFrozenRows: () => undefined,
+        autoResizeColumns: () => undefined,
+      }),
+    }),
+  };
+
+  return { urls, written };
+}
+
+const billedPage = (batch: Job[], totalPages: number): FakeResponse => ({
+  status: 200,
+  body: { jobs: batch, total_pages: totalPages },
+  headers: { "X-Credits-Deducted": String(batch.length * 3), "X-Credits-Balance": "40" },
+});
+
+describe("importJobs", () => {
+  it("writes the pages already billed when a later page returns 402", () => {
+    const { urls, written } = installAppsScript([
+      billedPage(jobs(100), 3),
+      { status: 402, body: { detail: "Balance too low." } },
+    ]);
+
+    const result = importJobs({ limit: 300 });
+
+    assert.equal(written.length, 1, "page 1 should land in a sheet");
+    assert.equal(written[0].length, 101, "header row + the 100 fetched jobs");
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^Imported 100 of the 300 jobs requested before the import stopped\./);
+    assert.match(result.message, /wallet balance is too low/i);
+    assert.match(result.message, /Cost: \$0\.30 \(300 credits\)/);
+    assert.equal(urls.length, 2, "a 402 is never retried");
+    assert.match(urls[1], /[?&]page=2&/);
+  });
+
+  it("writes the pages already billed when a later page keeps failing after retries", () => {
+    const { urls, written } = installAppsScript([
+      billedPage(jobs(100), 2),
+      { status: 503 },
+      { status: 503 },
+      { status: 503 },
+    ]);
+
+    const result = importJobs({ limit: 200 });
+
+    assert.equal(urls.length, 4, "page 2 is tried three times");
+    assert.equal(written[0].length, 101);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^Imported 100 of the 200 jobs requested/);
+    assert.match(result.message, /HTTP 503/);
+  });
+
+  it("writes the pages already billed when a later fetch throws", () => {
+    const { written } = installAppsScript([billedPage(jobs(100), 2), new Error("Address unavailable")]);
+
+    const result = importJobs({ limit: 200 });
+
+    assert.equal(written[0].length, 101);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /Address unavailable/);
+  });
+
+  it("writes nothing when the first page fails", () => {
+    const { written } = installAppsScript([{ status: 402, body: { detail: "Balance too low." } }]);
+
+    const result = importJobs({ limit: 300 });
+
+    assert.equal(written.length, 0);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^Your Jobo wallet balance is too low/);
+  });
+
+  it("reports a complete import as before", () => {
+    const { written } = installAppsScript([billedPage(jobs(100), 2), billedPage(jobs(50, 100), 2)]);
+
+    const result = importJobs({ limit: 150 });
+
+    assert.equal(written[0].length, 151);
+    assert.equal(result.ok, true);
+    assert.match(result.message, /^Imported 150 jobs\. Cost: \$0\.45 \(450 credits\)\./);
+  });
+});
 
 describe("retry policy", () => {
   it("never retries insufficient credits — the precheck would fail identically", () => {

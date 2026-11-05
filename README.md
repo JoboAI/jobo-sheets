@@ -65,10 +65,11 @@ npx --yes @google/clasp login && npm run push
 
 ## Not covered by the tests
 
-The live API round trip, and anything requiring the Apps Script runtime itself — `UrlFetchApp`,
+The live API round trip, and anything requiring the Apps Script runtime itself — the real `UrlFetchApp`,
 `PropertiesService`, sheet writes, and the sidebar. The tests cover retry classification, failure
-messaging, query building, location formatting and sheet naming. Everything else needs a real deployment
-and a `jbe_test_` key.
+messaging, query building, location formatting and sheet naming, plus the import loop against a scripted
+fake of those services (a failed later page still writes the pages already billed). Everything else needs a
+real deployment and a `jbe_test_` key.
 
 ## Publishing
 
