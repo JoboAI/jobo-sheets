@@ -173,7 +173,7 @@ export function describeFailure(status: number, body: unknown): string {
     return `Your Jobo wallet balance is too low for this import. ${detail ?? ""} Top up your wallet at enterprise.jobo.world, or import fewer jobs.`.trim();
   }
   if (status === 401 || status === 403) {
-    return "Jobo rejected the API key. Check it is current at enterprise.jobo.world/api-keys.";
+    return "Jobo rejected the API key. Check it is current at https://enterprise.jobo.world/api-keys?src=sheets.";
   }
   if (status === 429) {
     return "Jobo rate limit reached. Wait a minute and try again.";
