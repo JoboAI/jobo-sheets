@@ -250,7 +250,29 @@ describe("filter drift guard", () => {
   it("covers every core search filter except the documented one-shot gaps", () => {
     // This connector is a one-shot import, not an incremental sync — the
     // backward-looking windows stay out deliberately (see Code.ts).
-    const knownGaps = new Set(["posted_before", "discovered_after", "discovered_before"]);
+    const knownGaps = new Set([
+      "posted_before",
+      "discovered_after",
+      "discovered_before",
+      // connector-core 0.4.0 filters the add-on does not offer yet: it reads
+      // GET /api/jobs, which has no companies or exclude filters. Not yet
+      // supported here (n8n has them); remove each as the sidebar gains it.
+      "companies",
+      "exclude_companies",
+      "language",
+      "exclude_skills",
+      "exclude_industries",
+      "company_categories",
+      "exclude_company_categories",
+      "job_categories",
+      "exclude_job_categories",
+      "job_subcategories",
+      "exclude_job_subcategories",
+      "occupation_ids",
+      "exclude_occupation_ids",
+      "sort",
+      "description_format",
+    ]);
 
     const coreKeys = JOB_SEARCH_FILTERS.map((filter) => filter.key);
     for (const key of coreKeys) {
