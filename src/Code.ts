@@ -16,11 +16,20 @@
  */
 
 import {
+  COMPANY_CATEGORIES,
   EMPLOYMENT_TYPES,
   EXPERIENCE_LEVELS,
+  LANGUAGES,
   WORK_MODELS,
   isValidApiKeyFormat,
+  toJobSearchBody,
+  type CompanySuggestion,
   type Job,
+  type JobFacet,
+  type JobSearchFilters,
+  type JobSearchResponse,
+  type OccupationTaxonomyResponse,
+  type SearchSortValue,
 } from "@jobo-ai/connector-core";
 
 declare const SpreadsheetApp: GoogleAppsScript.Spreadsheet.SpreadsheetApp;
@@ -100,8 +109,11 @@ function readNumber(headers: Record<string, string>, name: string): number | nul
   return isFinite(parsed) ? parsed : null;
 }
 
-/** One blocking request, with connector-core's retry policy applied. */
-function request(path: string, apiKey: string): ApiResult {
+/**
+ * One blocking request, with connector-core's retry policy applied. A `json`
+ * body makes it a JSON POST (the search endpoint); otherwise a GET.
+ */
+function request(path: string, apiKey: string, json?: unknown): ApiResult {
   let last: ApiResult | null = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -109,10 +121,11 @@ function request(path: string, apiKey: string): ApiResult {
     // non-2xx and the body — carrying the problem details and credit headers —
     // is lost, so nothing could be mapped to a useful message.
     const response = UrlFetchApp.fetch(`${BASE_URL}${path}`, {
-      method: "get",
+      method: json === undefined ? "get" : "post",
       // X-Jobo-Client is how the API attributes this traffic to the add-on;
       // Apps Script owns the User-Agent and will not let us set one.
       headers: { "X-Api-Key": apiKey, Accept: "application/json", "X-Jobo-Client": "sheets" },
+      ...(json === undefined ? {} : { contentType: "application/json", payload: JSON.stringify(json) }),
       muteHttpExceptions: true,
     });
 
@@ -221,12 +234,16 @@ function getSettings(): {
   workModels: string[];
   employmentTypes: string[];
   experienceLevels: string[];
+  companyCategories: string[];
+  languages: Array<{ code: string; name: string }>;
 } {
   return {
     hasKey: Boolean(PropertiesService.getUserProperties().getProperty(API_KEY_PROPERTY)),
     workModels: WORK_MODELS.slice(),
     employmentTypes: EMPLOYMENT_TYPES.slice(),
     experienceLevels: EXPERIENCE_LEVELS.slice(),
+    companyCategories: COMPANY_CATEGORIES.slice(),
+    languages: LANGUAGES.map((language) => ({ code: language.code, name: language.name })),
   };
 }
 
@@ -251,33 +268,78 @@ function clearApiKey(): void {
   PropertiesService.getUserProperties().deleteProperty(API_KEY_PROPERTY);
 }
 
-const FILTER_OPTIONS_CACHE_KEY = "jobo_filter_options_v1";
+// v2: added skills and the job category/subcategory options.
+const FILTER_OPTIONS_CACHE_KEY = "jobo_filter_options_v2";
 /** 6 hours — the CacheService maximum. Source/industry churn is slower than this. */
 const FILTER_OPTIONS_CACHE_SECONDS = 21600;
+
+/** A picker option: `value` is what the filter takes, `label` what the user reads. */
+export interface PickerOption {
+  value: string;
+  label: string;
+  count?: number;
+}
 
 export interface FilterOptionsResult {
   ok: boolean;
   sources: string[];
   industries: string[];
+  /** The most common skills; the skills pickers still accept any typed skill. */
+  skills: string[];
+  jobCategories: PickerOption[];
+  jobSubcategories: PickerOption[];
 }
 
-function readOptionKeys(body: unknown, listField: string): string[] {
+const NO_FILTER_OPTIONS: FilterOptionsResult = {
+  ok: false,
+  sources: [],
+  industries: [],
+  skills: [],
+  jobCategories: [],
+  jobSubcategories: [],
+};
+
+function readOptions(body: unknown, listField: string): JobFacet[] {
   if (!body || typeof body !== "object") return [];
   const list = (body as Record<string, unknown>)[listField];
   if (!Array.isArray(list)) return [];
-  return list
-    .map((entry) =>
-      entry && typeof entry === "object" ? (entry as Record<string, unknown>).key : null,
-    )
-    .filter((key): key is string => typeof key === "string" && key.length > 0);
+  return list.filter(
+    (entry): entry is JobFacet =>
+      Boolean(entry) && typeof (entry as JobFacet).key === "string" && (entry as JobFacet).key.length > 0,
+  );
+}
+
+function readOptionKeys(body: unknown, listField: string): string[] {
+  return readOptions(body, listField).map((option) => option.key);
+}
+
+function titleCase(value: string): string {
+  return value.replace(/(^|[\s/&-])([a-z])/g, (_match, lead: string, letter: string) => lead + letter.toUpperCase());
 }
 
 /**
- * Dynamic filter options for the sidebar comboboxes. Both lists are small
+ * Category / subcategory picker options from the occupation facets. The value
+ * is the display name ("Healthcare"), which the case-insensitive filter takes;
+ * a subcategory's label carries its category, since names alone are terse.
+ */
+export function occupationLevelOptions(options: JobFacet[], withParent: boolean): PickerOption[] {
+  return options
+    .map((option) => {
+      const name = option.name ?? titleCase(option.key);
+      const label = withParent && option.parent ? `${name} · ${titleCase(option.parent)}` : name;
+      return { value: name, label, count: option.count };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/**
+ * Dynamic filter options for the sidebar comboboxes. Every list is small
  * enough (≤250) to ship whole and filter client-side — a per-keystroke
  * google.script.run round trip is far too slow for typeahead. Cached in the
  * script cache (shared across users; the lists are not user-specific).
- * `ok: false` tells the sidebar to fall back to free-text chips.
+ * `ok: false` tells the sidebar to fall back to free-text chips. The
+ * occupation facets answer 404 until occupations are published; those lists
+ * then stay empty and their pickers take free text.
  */
 function getFilterOptions(): FilterOptionsResult {
   try {
@@ -287,24 +349,98 @@ function getFilterOptions(): FilterOptionsResult {
 
     const key = apiKey();
     const filters = request("/api/connectors/filters", key);
-    if (filters.status < 200 || filters.status >= 300) {
-      return { ok: false, sources: [], industries: [] };
-    }
-    const industries = request("/api/connectors/filter-options/industries?limit=250", key);
+    if (filters.status < 200 || filters.status >= 300) return NO_FILTER_OPTIONS;
+
+    const facet = (name: string): JobFacet[] => {
+      const result = request(`/api/connectors/filter-options/${name}?limit=250`, key);
+      return result.status >= 200 && result.status < 300 ? readOptions(result.body, "options") : [];
+    };
 
     const result: FilterOptionsResult = {
       ok: true,
       sources: readOptionKeys(filters.body, "sources"),
-      industries:
-        industries.status >= 200 && industries.status < 300
-          ? readOptionKeys(industries.body, "options")
-          : [],
+      industries: facet("industries").map((option) => option.key),
+      skills: facet("skills").map((option) => option.key),
+      jobCategories: occupationLevelOptions(facet("job_categories"), false),
+      jobSubcategories: occupationLevelOptions(facet("job_subcategories"), true),
     };
-    cache.put(FILTER_OPTIONS_CACHE_KEY, JSON.stringify(result), FILTER_OPTIONS_CACHE_SECONDS);
+    try {
+      cache.put(FILTER_OPTIONS_CACHE_KEY, JSON.stringify(result), FILTER_OPTIONS_CACHE_SECONDS);
+    } catch {
+      // Over CacheService's 100 KB value limit: serve it uncached.
+    }
     return result;
   } catch {
-    return { ok: false, sources: [], industries: [] };
+    return NO_FILTER_OPTIONS;
   }
+}
+
+/**
+ * Every occupation, flattened for the occupation pickers: `value` is the id
+ * `occupation_ids` takes, `label` the name with its category › subcategory.
+ * The sidebar loads it once and filters locally (a few thousand entries —
+ * too large for CacheService, so fetched per sidebar open; the endpoint is
+ * free). Empty when occupations are not published or the call fails, which
+ * leaves the pickers on free text.
+ */
+function getOccupations(): PickerOption[] {
+  try {
+    const result = request("/api/occupations", apiKey());
+    if (result.status < 200 || result.status >= 300) return [];
+    return flattenOccupations(result.body as OccupationTaxonomyResponse);
+  } catch {
+    return [];
+  }
+}
+
+export function flattenOccupations(taxonomy: OccupationTaxonomyResponse | null | undefined): PickerOption[] {
+  const out: PickerOption[] = [];
+  for (const category of taxonomy?.categories ?? []) {
+    for (const sub of category.subcategories ?? []) {
+      for (const occupation of sub.occupations ?? []) {
+        out.push({ value: occupation.id, label: `${occupation.name} (${category.name} › ${sub.name})` });
+      }
+    }
+  }
+  return out.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export interface CompanySuggestionResult {
+  suggestions: Array<{ label: string; value: string; ids: string[]; count?: number }>;
+}
+
+/**
+ * Company typeahead proxy (name or domain prefix, 2+ characters). Each pick
+ * carries every board id of the company, which is what the `companies`
+ * filter should receive — a name would also match every other company called
+ * that. Never throws: an empty list keeps the field usable as free text.
+ */
+function suggestCompanies(q: string): CompanySuggestionResult {
+  const trimmed = (q || "").trim();
+  if (trimmed.length < 2) return { suggestions: [] };
+  try {
+    const result = request(
+      "/api/connectors/companies/suggest" + buildQuery({ q: trimmed, limit: 8 }),
+      apiKey(),
+    );
+    if (result.status < 200 || result.status >= 300) return { suggestions: [] };
+    const body = result.body as { suggestions?: CompanySuggestion[] };
+    return { suggestions: (Array.isArray(body.suggestions) ? body.suggestions : []).map(companyPickerItem) };
+  } catch {
+    return { suggestions: [] };
+  }
+}
+
+export function companyPickerItem(company: CompanySuggestion): CompanySuggestionResult["suggestions"][number] {
+  const ids = company.ids && company.ids.length > 0 ? company.ids : [company.id];
+  const details = [company.domain, company.country].filter(Boolean).join(", ");
+  return {
+    label: details ? `${company.name} (${details})` : company.name,
+    // Unique per company, so picking it twice is a no-op in the chip row.
+    value: ids.join(","),
+    ids,
+    ...(typeof company.job_count === "number" ? { count: company.job_count } : {}),
+  };
 }
 
 export interface LocationSuggestionResult {
@@ -343,29 +479,63 @@ function suggestLocations(q: string): LocationSuggestionResult {
  * connector-core's JOB_SEARCH_FILTERS by the drift-guard test. Deliberately
  * absent: posted_before / discovered_after / discovered_before — this is a
  * one-shot import UI, not an incremental sync, so backward-looking windows
- * add noise without a use case (posted_after alone covers "recent jobs").
+ * add noise without a use case (posted_after alone covers "recent jobs") —
+ * and description_format, since the sheet has no description column.
  */
 export const SHEETS_SUPPORTED_FILTER_KEYS: readonly string[] = [
   "q",
   "location",
   "sources",
+  "companies",
+  "exclude_companies",
   "work_model",
   "employment_type",
   "experience_level",
+  "language",
   "skills",
+  "exclude_skills",
   "industries",
+  "exclude_industries",
+  "company_categories",
+  "exclude_company_categories",
+  "job_categories",
+  "exclude_job_categories",
+  "job_subcategories",
+  "exclude_job_subcategories",
+  "occupation_ids",
+  "exclude_occupation_ids",
   "min_salary_usd",
   "max_salary_usd",
   "posted_after",
   "search_description",
+  "sort",
 ];
 
-interface ImportRequest {
+/**
+ * What the sidebar sends. Every field is optional and an absent or empty one
+ * is no filter, so a request from an older sidebar (or any subset of fields)
+ * keeps working.
+ */
+export interface ImportRequest {
   q?: string;
   location?: string;
   sources?: string[];
+  /** Company ids (every id of a picked company), domains or whole names. */
+  companies?: string[];
+  excludeCompanies?: string[];
   skills?: string[];
+  excludeSkills?: string[];
   industries?: string[];
+  excludeIndustries?: string[];
+  companyCategories?: string[];
+  excludeCompanyCategories?: string[];
+  jobCategories?: string[];
+  excludeJobCategories?: string[];
+  jobSubcategories?: string[];
+  excludeJobSubcategories?: string[];
+  occupationIds?: string[];
+  excludeOccupationIds?: string[];
+  languages?: string[];
   workModels?: string[];
   employmentTypes?: string[];
   experienceLevels?: string[];
@@ -373,7 +543,61 @@ interface ImportRequest {
   maxSalaryUsd?: number;
   postedAfter?: string;
   searchDescriptions?: boolean;
+  sort?: string;
   limit?: number;
+}
+
+const SORTS: readonly SearchSortValue[] = ["relevance", "discovered_asc", "discovered_desc"];
+
+/** Sidebar request → connector-core filter values (keyed by JOB_SEARCH_FILTERS keys). */
+export function toSearchFilters(req: ImportRequest): JobSearchFilters {
+  const sort = SORTS.find((value) => value === req.sort);
+  return {
+    q: req.q,
+    location: req.location,
+    sources: req.sources,
+    companies: req.companies,
+    exclude_companies: req.excludeCompanies,
+    work_model: req.workModels,
+    employment_type: req.employmentTypes,
+    experience_level: req.experienceLevels,
+    language: req.languages,
+    skills: req.skills,
+    exclude_skills: req.excludeSkills,
+    industries: req.industries,
+    exclude_industries: req.excludeIndustries,
+    company_categories: req.companyCategories,
+    exclude_company_categories: req.excludeCompanyCategories,
+    job_categories: req.jobCategories,
+    exclude_job_categories: req.excludeJobCategories,
+    job_subcategories: req.jobSubcategories,
+    exclude_job_subcategories: req.excludeJobSubcategories,
+    occupation_ids: req.occupationIds,
+    exclude_occupation_ids: req.excludeOccupationIds,
+    min_salary_usd: req.minSalaryUsd,
+    max_salary_usd: req.maxSalaryUsd,
+    posted_after: req.postedAfter || undefined,
+    // true is the API default; only the opt-out travels on the wire.
+    search_description: req.searchDescriptions === false ? false : undefined,
+    sort,
+  };
+}
+
+/** The API's filter warnings (e.g. a company name that matched nothing), as one sentence each. */
+function warningText(body: unknown): string[] {
+  const warnings = (body as JobSearchResponse | null)?.warnings;
+  return Array.isArray(warnings)
+    ? warnings.map((warning) => warning?.message).filter((m): m is string => typeof m === "string" && m.length > 0)
+    : [];
+}
+
+/**
+ * One page size for the whole import (the API caps it at 100): the fewest
+ * pages, split evenly, so the last page overshoots `limit` by at most one job
+ * per page — 150 → 2 × 75, 1000 → 10 × 100, 101 → 2 × 51.
+ */
+export function importPageSize(limit: number): number {
+  return Math.ceil(limit / Math.ceil(limit / 100));
 }
 
 /**
@@ -394,33 +618,29 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
     let quotaLimit: number | null = null;
     let quotaRemaining: number | null = null;
     let failure: string | null = null;
+    const notes: string[] = [];
+    const filters = toSearchFilters(req);
+    const pageSize = importPageSize(limit);
 
     while (jobs.length < limit) {
-      const path =
-        "/api/jobs" +
-        buildQuery({
-          q: req.q,
-          location: req.location,
-          sources: (req.sources ?? []).join(","),
-          skills: (req.skills ?? []).join(","),
-          industries: (req.industries ?? []).join(","),
-          work_model: (req.workModels ?? []).join(","),
-          employment_type: (req.employmentTypes ?? []).join(","),
-          experience_level: (req.experienceLevels ?? []).join(","),
-          min_salary_usd: req.minSalaryUsd && req.minSalaryUsd > 0 ? req.minSalaryUsd : undefined,
-          max_salary_usd: req.maxSalaryUsd && req.maxSalaryUsd > 0 ? req.maxSalaryUsd : undefined,
-          posted_after: req.postedAfter || undefined,
-          // true is the API default; only the opt-out travels on the wire.
-          search_description: req.searchDescriptions === false ? "false" : undefined,
-          page,
-          page_size: Math.min(100, limit - jobs.length),
-        });
+      // POST /api/jobs/search: the include/exclude and taxonomy filters exist
+      // only on the body surface. toJobSearchBody drops empty values, so an
+      // untouched picker never becomes a filter.
+      const body = toJobSearchBody(filters, {
+        page,
+        // Constant across pages: `page` offsets by page_size, so shrinking
+        // the last page re-fetched jobs already imported.
+        page_size: pageSize,
+        // The sheet has no description column; facets are never shown.
+        include_facets: [],
+        include_fields: [],
+      });
 
       // UrlFetchApp throws on network faults even with muteHttpExceptions, so a
       // thrown page stops the loop the same way a failed status does.
       let result: ApiResult;
       try {
-        result = request(path, key);
+        result = request("/api/jobs/search", key, body);
       } catch (err) {
         failure = (err as Error).message;
         break;
@@ -435,6 +655,8 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
       quotaLimit = result.quotaLimit ?? quotaLimit;
       quotaRemaining = result.quotaRemaining ?? quotaRemaining;
 
+      if (page === 1) notes.push(...warningText(result.body));
+
       const data = result.body as { jobs?: Job[]; total_pages?: number };
       const batch = data.jobs ?? [];
       for (const job of batch) jobs.push(job);
@@ -442,11 +664,14 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
       if (batch.length === 0 || page >= (data.total_pages ?? 1)) break;
       page++;
     }
+    // Equal pages can overshoot the limit by a few jobs; never write more.
+    if (jobs.length > limit) jobs.length = limit;
 
+    const note = notes.length > 0 ? ` Note: ${notes.join(" ")}` : "";
     if (jobs.length === 0) {
       return failure != null
         ? { ok: false, message: failure }
-        : { ok: true, message: "No jobs matched those filters." };
+        : { ok: true, message: `No jobs matched those filters.${note}` };
     }
 
     writeSheet(jobs);
@@ -459,10 +684,10 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
     if (failure != null) {
       return {
         ok: false,
-        message: `Imported ${jobs.length} of the ${limit} jobs requested before the import stopped. ${failure}${cost}${left}${included}`,
+        message: `Imported ${jobs.length} of the ${limit} jobs requested before the import stopped. ${failure}${cost}${left}${included}${note}`,
       };
     }
-    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${included}` };
+    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${included}${note}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };
   }
@@ -503,4 +728,6 @@ globals.saveApiKey = saveApiKey;
 globals.clearApiKey = clearApiKey;
 globals.getFilterOptions = getFilterOptions;
 globals.suggestLocations = suggestLocations;
+globals.suggestCompanies = suggestCompanies;
+globals.getOccupations = getOccupations;
 globals.importJobs = importJobs;

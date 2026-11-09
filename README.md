@@ -37,7 +37,27 @@ handler returns. Spin-waiting on a promise would work in testing and fail unpred
 
 So `Code.ts` makes blocking `UrlFetchApp` calls and reproduces the part of connector-core's behaviour that
 actually matters — **which statuses are terminal** — explicitly, with tests. It still shares the canonical
-filter values, the `Job` type and API key validation, so those cannot drift.
+filter values, the `Job` type, API key validation and `toJobSearchBody()` (the sidebar request becomes a
+`POST /api/jobs/search` body through it), so those cannot drift.
+
+## Filters
+
+The sidebar covers connector-core's `JOB_SEARCH_FILTERS` (pinned `0.4.0`) except `posted_before`,
+`discovered_after`, `discovered_before` (a one-shot import has no use for those windows) and
+`description_format` (no description column). `SHEETS_SUPPORTED_FILTER_KEYS` plus the drift-guard test in
+`Code.test.ts` keep that list honest.
+
+| Picker | Source |
+| --- | --- |
+| Location | `suggestLocations` → `GET /api/connectors/locations/suggest`, per keystroke |
+| Companies (include, exclude) | `suggestCompanies` → `GET /api/connectors/companies/suggest`, per keystroke; a pick sends every board id of the company |
+| Occupations (include, exclude) | `getOccupations` → `GET /api/occupations` once per sidebar open, filtered locally (too large for `CacheService`) |
+| Sources, industries, skills, job categories, job subcategories | `getFilterOptions` → `GET /api/connectors/filter-options/{facet}?limit=250`, script-cached 6 h, filtered locally |
+| Languages, company categories, work model, employment type, experience level | Static lists from connector-core |
+
+Every `importJobs` field is optional and an empty one is no filter, so an older sidebar's request still
+works. Pages are equal-sized (`importPageSize`): `page` offsets by `page_size`, so shrinking the last page
+used to re-fetch jobs already imported.
 
 `muteHttpExceptions: true` is load-bearing: without it Apps Script throws on any non-2xx and discards the
 response body, taking the problem details and the credit headers with it.
@@ -67,9 +87,10 @@ npx --yes @google/clasp login && npm run push
 
 The live API round trip, and anything requiring the Apps Script runtime itself — the real `UrlFetchApp`,
 `PropertiesService`, sheet writes, and the sidebar. The tests cover retry classification, failure
-messaging, query building, location formatting and sheet naming, plus the import loop against a scripted
-fake of those services (a failed later page still writes the pages already billed). Everything else needs a
-real deployment and a `jbe_test_` key.
+messaging, query building, location formatting, sheet naming and the picker option mapping, plus the import
+loop against a scripted fake of those services (the exact search body every filter produces, equal page
+sizes, API warnings in the message, and a failed later page still writing the pages already billed).
+Everything else needs a real deployment and a `jbe_test_` key.
 
 ## Publishing
 

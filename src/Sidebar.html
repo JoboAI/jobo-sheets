@@ -76,6 +76,26 @@
       input[type="number"] {
         font-variant-numeric: tabular-nums;
       }
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        height: 36px;
+        padding: 0 8px;
+        border: 1px solid var(--jobo-ink-300);
+        border-radius: 0;
+        background: #fff;
+        font-family: inherit;
+        font-size: 13px;
+        color: var(--jobo-ink-800);
+      }
+      select:focus {
+        outline: none;
+        border-color: var(--jobo-ring);
+        box-shadow: 0 0 0 1px var(--jobo-ring);
+      }
+      details p.hint {
+        margin: 6px 0 0;
+      }
       input:not(.jobo-cb-input):hover {
         border-color: var(--jobo-ink-500);
       }
@@ -275,6 +295,12 @@
       <label id="locationLabel">Location</label>
       <div id="location"></div>
 
+      <label id="companiesLabel">Companies</label>
+      <div id="companies"></div>
+
+      <label id="occupationsLabel">Occupations</label>
+      <div id="occupations"></div>
+
       <label id="sourcesLabel">Sources</label>
       <div id="sources"></div>
 
@@ -301,12 +327,45 @@
 
       <details>
         <summary> More filters</summary>
+        <label id="jobCategoriesLabel">Job categories</label>
+        <div id="jobCategories"></div>
+        <label id="jobSubcategoriesLabel">Job subcategories</label>
+        <div id="jobSubcategories"></div>
+        <label id="companyCategoriesLabel">Company categories</label>
+        <div id="companyCategories"></div>
+        <label id="languagesLabel">Description languages</label>
+        <div id="languages"></div>
         <label for="postedAfter">Posted after</label>
         <input type="date" id="postedAfter" />
+        <label for="sort">Order</label>
+        <select id="sort">
+          <option value="relevance">Best match</option>
+          <option value="discovered_desc">Newest first</option>
+          <option value="discovered_asc">Oldest first</option>
+        </select>
         <label class="checks" style="margin-top: 10px">
           <input type="checkbox" id="searchDescriptions" checked />
           Search descriptions as well as titles
         </label>
+      </details>
+
+      <details>
+        <summary> Exclude</summary>
+        <p class="hint">Leave out jobs matching any of these.</p>
+        <label id="excludeCompaniesLabel">Companies</label>
+        <div id="excludeCompanies"></div>
+        <label id="excludeOccupationsLabel">Occupations</label>
+        <div id="excludeOccupations"></div>
+        <label id="excludeSkillsLabel">Skills</label>
+        <div id="excludeSkills"></div>
+        <label id="excludeIndustriesLabel">Industries</label>
+        <div id="excludeIndustries"></div>
+        <label id="excludeJobCategoriesLabel">Job categories</label>
+        <div id="excludeJobCategories"></div>
+        <label id="excludeJobSubcategoriesLabel">Job subcategories</label>
+        <div id="excludeJobSubcategories"></div>
+        <label id="excludeCompanyCategoriesLabel">Company categories</label>
+        <div id="excludeCompanyCategories"></div>
       </details>
 
       <label for="limit">How many jobs</label>
@@ -326,9 +385,8 @@
     <script>
       var STATE = null;
       var locationBox = null;
-      var sourcesBox = null;
-      var skillsBox = null;
-      var industriesBox = null;
+      /** Multi-value pickers by element id; each is a createJoboCombobox handle. */
+      var boxes = {};
 
       function el(id) { return document.getElementById(id); }
 
@@ -350,15 +408,30 @@
         return keys.map(function (key) { return { label: key, value: key }; });
       }
 
-      /** Client-side substring filter over a preloaded list — a per-keystroke
-       *  google.script.run round trip (~1s) is far too slow for typeahead, so
-       *  only Location (Photon suggest) goes to the server. */
-      function localFilter(list) {
+      /** Client-side substring filter over a preloaded list of {label, value,
+       *  count?} — a per-keystroke google.script.run round trip (~1s) is far
+       *  too slow for typeahead, so only Location and Companies go to the
+       *  server. */
+      function localFilter(items, max) {
         return function (query) {
           var q = query.toLowerCase();
-          var matches = list.filter(function (key) { return key.toLowerCase().indexOf(q) !== -1; });
-          return Promise.resolve(toItems(matches.slice(0, 12)));
+          var matches = items.filter(function (item) { return item.label.toLowerCase().indexOf(q) !== -1; });
+          return Promise.resolve(matches.slice(0, max || 12));
         };
+      }
+
+      /**
+       * (Re)mount a multi-value picker, keeping anything already picked —
+       * the dynamic options arrive after first paint, and a user may have
+       * started filling the form with the free-text fallback.
+       */
+      function mountPicker(id, opts) {
+        var picked = boxes[id] ? boxes[id].getValues() : [];
+        if (boxes[id]) boxes[id].destroy();
+        var options = { multi: true, dense: true, ariaLabel: el(id + 'Label') ? el(id + 'Label').textContent : id };
+        for (var key in opts) options[key] = opts[key];
+        options.initialValues = picked;
+        boxes[id] = createJoboCombobox(el(id), options);
       }
 
       function suggestLocationItems(query) {
@@ -372,7 +445,24 @@
         });
       }
 
+      /** Company picks carry every board id of the company (item.ids). */
+      function suggestCompanyItems(query) {
+        return serverCall('suggestCompanies', query).then(function (result) {
+          return result.suggestions || [];
+        });
+      }
+
+      var COMPANY_PICKER = {
+        fetchSuggestions: suggestCompanyItems,
+        // A domain or exact company name typed and committed with Enter also works.
+        allowFreeText: true,
+        placeholder: 'Name or domain, e.g. stripe',
+        noMatchesText: 'No matching company — press Enter to use what you typed'
+      };
+
       function mountFilterBoxes() {
+        // show() runs again after a key change: never mount twice into one root.
+        if (locationBox) locationBox.destroy();
         locationBox = createJoboCombobox(el('location'), {
           fetchSuggestions: suggestLocationItems,
           placeholder: 'e.g. Berlin, Germany',
@@ -380,55 +470,79 @@
           dense: true
         });
 
-        // Until the dynamic options arrive, sources/industries accept free
-        // text so the form never blocks on the API.
-        sourcesBox = createJoboCombobox(el('sources'), {
-          multi: true,
-          allowFreeText: true,
-          placeholder: 'e.g. greenhouse, lever_co',
-          ariaLabel: 'Sources',
-          dense: true
+        mountPicker('companies', COMPANY_PICKER);
+        mountPicker('excludeCompanies', COMPANY_PICKER);
+
+        // Static vocabularies from connector-core, filtered locally.
+        var languages = STATE.languages.map(function (l) { return { label: l.name + ' (' + l.code + ')', value: l.code }; });
+        var companyCategories = toItems(STATE.companyCategories);
+        mountPicker('languages', { fetchSuggestions: localFilter(languages, 40), minChars: 1, placeholder: 'e.g. English, German' });
+        ['companyCategories', 'excludeCompanyCategories'].forEach(function (id) {
+          mountPicker(id, { fetchSuggestions: localFilter(companyCategories, 20), minChars: 1, placeholder: 'e.g. saas, agency' });
         });
-        industriesBox = createJoboCombobox(el('industries'), {
-          multi: true,
-          allowFreeText: true,
-          placeholder: 'e.g. fintech',
-          ariaLabel: 'Industries',
-          dense: true
+
+        // Until the dynamic options arrive, these accept free text so the
+        // form never blocks on the API.
+        var freeText = {
+          sources: 'e.g. greenhouse, lever_co',
+          industries: 'e.g. fintech',
+          excludeIndustries: 'e.g. staffing',
+          skills: 'e.g. Python — press Enter to add',
+          excludeSkills: 'e.g. PHP — press Enter to add',
+          jobCategories: 'e.g. Healthcare',
+          excludeJobCategories: 'e.g. Sales',
+          jobSubcategories: 'e.g. Nursing',
+          excludeJobSubcategories: 'e.g. Retail Sales'
+        };
+        Object.keys(freeText).forEach(function (id) {
+          mountPicker(id, { allowFreeText: true, placeholder: freeText[id] });
         });
-        skillsBox = createJoboCombobox(el('skills'), {
-          multi: true,
-          allowFreeText: true,
-          placeholder: 'e.g. Python — press Enter to add',
-          ariaLabel: 'Skills',
-          dense: true
+        ['occupations', 'excludeOccupations'].forEach(function (id) {
+          mountPicker(id, { placeholder: 'Loading occupations…' });
         });
 
         serverCall('getFilterOptions').then(function (options) {
           if (!options || !options.ok) return; // keep free-text fallback
           if (options.sources.length > 0) {
-            sourcesBox.destroy();
-            sourcesBox = createJoboCombobox(el('sources'), {
-              multi: true,
-              fetchSuggestions: localFilter(options.sources),
-              placeholder: 'Start typing to see sources',
-              ariaLabel: 'Sources',
-              minChars: 1,
-              dense: true
-            });
+            mountPicker('sources', { fetchSuggestions: localFilter(toItems(options.sources)), minChars: 1, placeholder: 'Start typing to see sources' });
           }
           if (options.industries.length > 0) {
-            industriesBox.destroy();
-            industriesBox = createJoboCombobox(el('industries'), {
-              multi: true,
-              fetchSuggestions: localFilter(options.industries),
-              placeholder: 'Start typing to see industries',
-              ariaLabel: 'Industries',
-              minChars: 1,
-              dense: true
+            ['industries', 'excludeIndustries'].forEach(function (id) {
+              mountPicker(id, { fetchSuggestions: localFilter(toItems(options.industries)), minChars: 1, placeholder: 'Start typing to see industries' });
+            });
+          }
+          if (options.skills && options.skills.length > 0) {
+            // Common skills suggested; any other skill can still be typed.
+            ['skills', 'excludeSkills'].forEach(function (id) {
+              mountPicker(id, { fetchSuggestions: localFilter(toItems(options.skills)), allowFreeText: true, minChars: 1, placeholder: freeText[id] });
+            });
+          }
+          if (options.jobCategories && options.jobCategories.length > 0) {
+            ['jobCategories', 'excludeJobCategories'].forEach(function (id) {
+              mountPicker(id, { fetchSuggestions: localFilter(options.jobCategories, 40), minChars: 1, placeholder: 'Start typing to see categories' });
+            });
+          }
+          if (options.jobSubcategories && options.jobSubcategories.length > 0) {
+            ['jobSubcategories', 'excludeJobSubcategories'].forEach(function (id) {
+              mountPicker(id, { fetchSuggestions: localFilter(options.jobSubcategories, 40), minChars: 1, placeholder: 'Start typing to see subcategories' });
             });
           }
         }).catch(function () { /* fallback stays */ });
+
+        // Occupation ids are not something anyone types, so these pickers
+        // only take picks from the taxonomy (loaded once, filtered locally).
+        serverCall('getOccupations').then(function (occupations) {
+          var list = occupations || [];
+          ['occupations', 'excludeOccupations'].forEach(function (id) {
+            mountPicker(id, list.length > 0
+              ? { fetchSuggestions: localFilter(list, 25), placeholder: 'e.g. registered nurse' }
+              : { placeholder: 'Occupations are unavailable right now' });
+          });
+        }).catch(function () {
+          ['occupations', 'excludeOccupations'].forEach(function (id) {
+            mountPicker(id, { placeholder: 'Occupations are unavailable right now' });
+          });
+        });
       }
 
       function renderChecks(containerId, values) {
@@ -446,17 +560,27 @@
       }
 
       function checked(containerId) {
-        var boxes = el(containerId).querySelectorAll('input:checked');
-        return Array.prototype.map.call(boxes, function (b) { return b.value; });
+        var inputs = el(containerId).querySelectorAll('input:checked');
+        return Array.prototype.map.call(inputs, function (b) { return b.value; });
       }
 
-      function chipValues(box) {
-        return box.getValues().map(function (v) { return v.value; });
+      function chipValues(id) {
+        return boxes[id] ? boxes[id].getValues().map(function (v) { return v.value; }) : [];
+      }
+
+      /** A picked company is every one of its board ids; typed text is sent as-is. */
+      function companyValues(id) {
+        if (!boxes[id]) return [];
+        var out = [];
+        boxes[id].getValues().forEach(function (v) {
+          (v.ids && v.ids.length > 0 ? v.ids : [v.value]).forEach(function (value) { out.push(value); });
+        });
+        return out;
       }
 
       /** Chip if picked, otherwise whatever is typed — free text is valid. */
       function locationValue() {
-        var values = chipValues(locationBox);
+        var values = locationBox.getValues().map(function (v) { return v.value; });
         if (values.length > 0) return values[0];
         var input = el('location').querySelector('input');
         return input ? input.value.trim() : '';
@@ -512,15 +636,29 @@
         serverCall('importJobs', {
           q: el('q').value,
           location: locationValue(),
-          sources: chipValues(sourcesBox),
-          skills: chipValues(skillsBox),
-          industries: chipValues(industriesBox),
+          sources: chipValues('sources'),
+          companies: companyValues('companies'),
+          excludeCompanies: companyValues('excludeCompanies'),
+          occupationIds: chipValues('occupations'),
+          excludeOccupationIds: chipValues('excludeOccupations'),
+          skills: chipValues('skills'),
+          excludeSkills: chipValues('excludeSkills'),
+          industries: chipValues('industries'),
+          excludeIndustries: chipValues('excludeIndustries'),
+          jobCategories: chipValues('jobCategories'),
+          excludeJobCategories: chipValues('excludeJobCategories'),
+          jobSubcategories: chipValues('jobSubcategories'),
+          excludeJobSubcategories: chipValues('excludeJobSubcategories'),
+          companyCategories: chipValues('companyCategories'),
+          excludeCompanyCategories: chipValues('excludeCompanyCategories'),
+          languages: chipValues('languages'),
           workModels: checked('workModels'),
           employmentTypes: checked('employmentTypes'),
           experienceLevels: checked('experienceLevels'),
           minSalaryUsd: Number(el('minSalary').value || 0),
           maxSalaryUsd: Number(el('maxSalary').value || 0),
           postedAfter: el('postedAfter').value || '',
+          sort: el('sort').value,
           searchDescriptions: el('searchDescriptions').checked,
           limit: Number(el('limit').value || 100)
         })

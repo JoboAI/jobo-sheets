@@ -4,11 +4,16 @@ import { describe, it } from "node:test";
 import {
   SHEETS_SUPPORTED_FILTER_KEYS,
   buildQuery,
+  companyPickerItem,
   describeFailure,
+  flattenOccupations,
   formatLocation,
   importJobs,
+  importPageSize,
   isRetryableStatus,
   neutralizeFormula,
+  occupationLevelOptions,
+  toSearchFilters,
   uniqueSheetName,
 } from "./Code.js";
 import { JOB_SEARCH_FILTERS, type Job } from "@jobo-ai/connector-core";
@@ -58,16 +63,22 @@ interface FakeResponse {
  * scripted UrlFetchApp (an Error entry is thrown, like a network fault), and a
  * spreadsheet that records what was written.
  */
-function installAppsScript(responses: Array<FakeResponse | Error>): { urls: string[]; written: unknown[][][] } {
+function installAppsScript(responses: Array<FakeResponse | Error>): {
+  urls: string[];
+  bodies: Array<Record<string, unknown> | null>;
+  written: unknown[][][];
+} {
   const urls: string[] = [];
+  const bodies: Array<Record<string, unknown> | null> = [];
   const written: unknown[][][] = [];
   const g = globalThis as unknown as Record<string, unknown>;
 
   g.PropertiesService = { getUserProperties: () => ({ getProperty: () => "jbe_test_key" }) };
   g.Utilities = { sleep: () => undefined };
   g.UrlFetchApp = {
-    fetch: (url: string) => {
+    fetch: (url: string, options: { method?: string; payload?: string } = {}) => {
       urls.push(url);
+      bodies.push(options.payload ? (JSON.parse(options.payload) as Record<string, unknown>) : null);
       const next = responses.shift();
       if (!next) throw new Error(`unexpected request ${url}`);
       if (next instanceof Error) throw next;
@@ -92,7 +103,7 @@ function installAppsScript(responses: Array<FakeResponse | Error>): { urls: stri
     }),
   };
 
-  return { urls, written };
+  return { urls, bodies, written };
 }
 
 const billedPage = (batch: Job[], totalPages: number): FakeResponse => ({
@@ -103,7 +114,7 @@ const billedPage = (batch: Job[], totalPages: number): FakeResponse => ({
 
 describe("importJobs", () => {
   it("writes the pages already billed when a later page returns 402", () => {
-    const { urls, written } = installAppsScript([
+    const { urls, bodies, written } = installAppsScript([
       billedPage(jobs(100), 3),
       { status: 402, body: { detail: "Balance too low." } },
     ]);
@@ -117,7 +128,99 @@ describe("importJobs", () => {
     assert.match(result.message, /wallet balance is too low/i);
     assert.match(result.message, /Cost: \$0\.30 \(300 credits\)/);
     assert.equal(urls.length, 2, "a 402 is never retried");
-    assert.match(urls[1], /[?&]page=2&/);
+    assert.equal(bodies[1]?.page, 2);
+  });
+
+  it("posts every sidebar filter to the search body and keeps the page size constant", () => {
+    const { urls, bodies } = installAppsScript([billedPage(jobs(75), 2), billedPage(jobs(75, 75), 2)]);
+
+    importJobs({
+      q: "nurse",
+      location: "Berlin, Germany",
+      sources: ["greenhouse"],
+      companies: ["id-1", "id-2", "acme.com"],
+      excludeCompanies: ["FedEx, Inc."],
+      skills: ["Python"],
+      excludeSkills: ["PHP"],
+      industries: ["Hospitals"],
+      excludeIndustries: ["Staffing"],
+      companyCategories: ["saas"],
+      excludeCompanyCategories: ["agency"],
+      jobCategories: ["Healthcare"],
+      excludeJobCategories: ["Sales"],
+      jobSubcategories: ["Nursing"],
+      excludeJobSubcategories: ["Midwifery"],
+      occupationIds: ["esco:abc"],
+      excludeOccupationIds: ["jobo:backend-developer"],
+      languages: ["de"],
+      workModels: ["remote"],
+      employmentTypes: ["full-time"],
+      experienceLevels: ["senior"],
+      minSalaryUsd: 50000,
+      maxSalaryUsd: 0,
+      postedAfter: "2026-11-01",
+      searchDescriptions: false,
+      sort: "discovered_desc",
+      limit: 150,
+    });
+
+    assert.match(urls[0], /\/api\/jobs\/search$/);
+    assert.deepEqual(bodies[0], {
+      queries: ["nurse"],
+      search_description: false,
+      locations: ["Berlin, Germany"],
+      sources: ["greenhouse"],
+      work_models: ["remote"],
+      employment_types: ["full-time"],
+      experience_levels: ["senior"],
+      languages: ["de"],
+      skills: { include: ["Python"], exclude: ["PHP"] },
+      companies: { include: ["id-1", "id-2", "acme.com"], exclude: ["FedEx, Inc."] },
+      industries: { include: ["Hospitals"], exclude: ["Staffing"] },
+      company_categories: { include: ["saas"], exclude: ["agency"] },
+      job_categories: { include: ["Healthcare"], exclude: ["Sales"] },
+      job_subcategories: { include: ["Nursing"], exclude: ["Midwifery"] },
+      occupation_ids: { include: ["esco:abc"], exclude: ["jobo:backend-developer"] },
+      salary_usd: { min: 50000 },
+      posted_after: "2026-11-01",
+      sort: "discovered_desc",
+      page: 1,
+      page_size: 75,
+      include_facets: [],
+      include_fields: [],
+    });
+    assert.equal(bodies[1]?.page, 2);
+    assert.equal(bodies[1]?.page_size, 75, "page 2 must use page 1's size or it re-fetches page-1 jobs");
+  });
+
+  it("sends nothing but paging for an empty or older-shaped request", () => {
+    const { bodies } = installAppsScript([billedPage(jobs(10), 1)]);
+
+    importJobs({ q: "", workModels: [], companies: [], sort: "bogus", limit: 10 });
+
+    assert.deepEqual(bodies[0], { page: 1, page_size: 10, include_facets: [], include_fields: [] });
+  });
+
+  it("passes the API's filter warnings on to the user", () => {
+    installAppsScript([
+      {
+        status: 200,
+        body: { jobs: [], total_pages: 0, warnings: [{ code: "companies_unmatched", message: "Bain matched no company." }] },
+      },
+    ]);
+
+    const result = importJobs({ companies: ["Bain"], limit: 10 });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.message, "No jobs matched those filters. Note: Bain matched no company.");
+  });
+
+  it("never writes more rows than requested when equal pages overshoot", () => {
+    const { written } = installAppsScript([billedPage(jobs(51), 2), billedPage(jobs(51, 51), 2)]);
+
+    importJobs({ limit: 101 });
+
+    assert.equal(written[0].length, 102, "header + 101 jobs");
   });
 
   it("writes the pages already billed when a later page keeps failing after retries", () => {
@@ -249,30 +352,9 @@ describe("query building", () => {
 describe("filter drift guard", () => {
   it("covers every core search filter except the documented one-shot gaps", () => {
     // This connector is a one-shot import, not an incremental sync — the
-    // backward-looking windows stay out deliberately (see Code.ts).
-    const knownGaps = new Set([
-      "posted_before",
-      "discovered_after",
-      "discovered_before",
-      // connector-core 0.4.0 filters the add-on does not offer yet: it reads
-      // GET /api/jobs, which has no companies or exclude filters. Not yet
-      // supported here (n8n has them); remove each as the sidebar gains it.
-      "companies",
-      "exclude_companies",
-      "language",
-      "exclude_skills",
-      "exclude_industries",
-      "company_categories",
-      "exclude_company_categories",
-      "job_categories",
-      "exclude_job_categories",
-      "job_subcategories",
-      "exclude_job_subcategories",
-      "occupation_ids",
-      "exclude_occupation_ids",
-      "sort",
-      "description_format",
-    ]);
+    // backward-looking windows stay out deliberately, and the sheet has no
+    // description column to format (see Code.ts).
+    const knownGaps = new Set(["posted_before", "discovered_after", "discovered_before", "description_format"]);
 
     const coreKeys = JOB_SEARCH_FILTERS.map((filter) => filter.key);
     for (const key of coreKeys) {
@@ -290,6 +372,68 @@ describe("filter drift guard", () => {
         `"${gap}" is listed as both supported and a gap`,
       );
     }
+  });
+});
+
+describe("picker options", () => {
+  it("splits an import into the fewest equal pages of at most 100", () => {
+    assert.equal(importPageSize(10), 10);
+    assert.equal(importPageSize(100), 100);
+    assert.equal(importPageSize(101), 51);
+    assert.equal(importPageSize(150), 75);
+    assert.equal(importPageSize(1000), 100);
+  });
+
+  it("turns a company suggestion into one chip carrying every board id", () => {
+    const item = companyPickerItem({
+      id: "b",
+      ids: ["a", "b"],
+      name: "Stripe",
+      domain: "stripe.com",
+      logo_url: null,
+      country: "US",
+      job_count: 43,
+    });
+    assert.deepEqual(item, { label: "Stripe (stripe.com, US)", value: "a,b", ids: ["a", "b"], count: 43 });
+
+    const bare = companyPickerItem({ id: "c", ids: [], name: "Acme", domain: null, logo_url: null, country: null, job_count: null });
+    assert.deepEqual(bare, { label: "Acme", value: "c", ids: ["c"] });
+  });
+
+  it("labels subcategories with their category and keeps the display name as the value", () => {
+    const options = occupationLevelOptions(
+      [
+        { key: "nursing", count: 12, name: "Nursing", parent: "healthcare" },
+        { key: "software development", count: 40 },
+      ],
+      true,
+    );
+    assert.deepEqual(options, [
+      { value: "Nursing", label: "Nursing · Healthcare", count: 12 },
+      { value: "Software Development", label: "Software Development", count: 40 },
+    ]);
+  });
+
+  it("flattens the taxonomy into occupation ids labelled with their place", () => {
+    const options = flattenOccupations({
+      version: "1",
+      categories: [
+        {
+          name: "Healthcare",
+          subcategories: [{ name: "Nursing", occupations: [{ id: "esco:rn", name: "Registered Nurse" }] }],
+        },
+      ],
+    });
+    assert.deepEqual(options, [{ value: "esco:rn", label: "Registered Nurse (Healthcare › Nursing)" }]);
+    assert.deepEqual(flattenOccupations(null), []);
+  });
+
+  it("maps the sidebar request onto the shared filter keys", () => {
+    const filters = toSearchFilters({ languages: ["en"], occupationIds: ["esco:abc"], searchDescriptions: true, sort: "relevance" });
+    assert.deepEqual(filters.language, ["en"]);
+    assert.deepEqual(filters.occupation_ids, ["esco:abc"]);
+    assert.equal(filters.search_description, undefined, "true is the default and is not sent");
+    assert.equal(filters.sort, "relevance");
   });
 });
 
