@@ -38,26 +38,36 @@ await build({
 // Apps Script expects .gs for server code.
 renameSync(join(dist, "Code.js"), join(dist, "Code.gs"));
 
-// ── Sidebar: inline the shared UI assets from packages/connector-ui ──────────
-// The sidebar HTML carries @inline markers instead of committed copies, so
+// ── HTML: inline the shared UI assets from packages/connector-ui ─────────────
+// The HTML files carry @inline markers instead of committed copies, so
 // tokens/combobox can never drift from their single source. combobox.js is
 // authored as an ES module for its tests; stripping `export ` leaves plain
 // function declarations a <script> block can use.
+//
+// Sidebar.html is the add-on's UI. Callback.html is the page a user lands on
+// after Sign in with Jobo; it is an Apps Script template and needs the tokens only.
 {
-  const inlines = [
-    { marker: "/* @inline:tokens.css */", file: "tokens.css", transform: (s) => s },
-    { marker: "/* @inline:combobox.css */", file: "combobox.css", transform: (s) => s },
-    { marker: "// @inline:combobox.js", file: "combobox.js", transform: (s) => s.replace(/^export /gm, "") },
+  const inlines = {
+    "tokens.css": { marker: "/* @inline:tokens.css */", transform: (s) => s },
+    "combobox.css": { marker: "/* @inline:combobox.css */", transform: (s) => s },
+    "combobox.js": { marker: "// @inline:combobox.js", transform: (s) => s.replace(/^export /gm, "") },
+  };
+  const pages = [
+    { page: "Sidebar.html", assets: ["tokens.css", "combobox.css", "combobox.js"] },
+    { page: "Callback.html", assets: ["tokens.css"] },
   ];
 
-  let sidebar = readFileSync(join(root, "src", "Sidebar.html"), "utf8");
-  for (const { marker, file, transform } of inlines) {
-    if (!sidebar.includes(marker)) {
-      throw new Error(`Sidebar.html is missing the inline marker "${marker}" for ${file}`);
+  for (const { page, assets } of pages) {
+    let html = readFileSync(join(root, "src", page), "utf8");
+    for (const file of assets) {
+      const { marker, transform } = inlines[file];
+      if (!html.includes(marker)) {
+        throw new Error(`${page} is missing the inline marker "${marker}" for ${file}`);
+      }
+      html = html.replace(marker, transform(readFileSync(join(connectorUi, file), "utf8")));
     }
-    sidebar = sidebar.replace(marker, transform(readFileSync(join(connectorUi, file), "utf8")));
+    writeFileSync(join(dist, page), html);
   }
-  writeFileSync(join(dist, "Sidebar.html"), sidebar);
 }
 
 copyFileSync(join(root, "appsscript.json"), join(dist, "appsscript.json"));
@@ -84,4 +94,4 @@ await build({
   legalComments: "none",
 });
 
-console.log("built dist/Code.gs, dist/Sidebar.html, dist/appsscript.json");
+console.log("built dist/Code.gs, dist/Sidebar.html, dist/Callback.html, dist/appsscript.json");

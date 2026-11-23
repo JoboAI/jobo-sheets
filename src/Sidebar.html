@@ -149,7 +149,10 @@
         outline: 2px solid var(--jobo-ring);
         outline-offset: 1px;
       }
-      button.primary {
+      /* a.primary is the same button as a link: Sign in with Jobo has to be a
+         real link that opens a new tab, since a sidebar cannot navigate away. */
+      button.primary,
+      a.primary {
         width: 100%;
         background: var(--jobo-ink-950);
         color: #fff;
@@ -163,21 +166,31 @@
         margin-top: 16px;
         transition: background-color var(--jobo-transition), border-color var(--jobo-transition);
       }
-      button.primary:hover {
+      a.primary {
+        display: block;
+        box-sizing: border-box;
+        text-align: center;
+      }
+      button.primary:hover,
+      a.primary:hover {
         background: var(--jobo-brand);
         border-color: var(--jobo-brand);
+        text-decoration: none;
       }
-      button.primary:active {
+      button.primary:active,
+      a.primary:active {
         background: var(--jobo-brand-deep);
         border-color: var(--jobo-brand-deep);
       }
-      button.primary:disabled {
+      button.primary:disabled,
+      a.primary[aria-disabled="true"] {
         background: var(--jobo-ink-100);
         border-color: var(--jobo-ink-200);
         color: var(--jobo-ink-400);
         cursor: default;
       }
       button.primary:focus-visible,
+      a.primary:focus-visible,
       button.link:focus-visible {
         outline: 2px solid var(--jobo-ring);
         outline-offset: 2px;
@@ -271,14 +284,27 @@
     <div id="setup" style="display: none">
       <p class="eyebrow">Connection</p>
       <h2>Connect to Jobo</h2>
-      <p class="hint">
-        Paste your API key. Get one at
-        <a href="https://enterprise.jobo.world/api-keys?src=sheets" target="_blank" rel="noopener">enterprise.jobo.world</a>.
-      </p>
-      <label for="apiKey">API key</label>
-      <input type="password" id="apiKey" placeholder="jbe_live_…" autocomplete="off" />
-      <button class="primary" id="saveKey">Save key</button>
-      <div class="status" id="setupStatus"></div>
+      <p class="hint">Sign in with your Jobo account. Sign-in opens in a new tab.</p>
+      <!-- A link, not a script redirect: a sidebar cannot navigate the top
+           window. It has no href until the server returns the sign-in URL. -->
+      <a class="primary" id="signIn" role="link" aria-disabled="true" target="_blank" rel="noopener">Sign in with Jobo</a>
+      <div id="signInWait" style="display: none">
+        <p class="hint" id="signInHint" style="margin: 12px 0 0"></p>
+        <button class="link" id="checkSignIn">I have signed in</button>
+      </div>
+      <div class="status" id="signInStatus"></div>
+
+      <details>
+        <summary> Paste an API key instead</summary>
+        <p class="hint">
+          Paste your API key. Get one at
+          <a href="https://enterprise.jobo.world/api-keys?src=sheets" target="_blank" rel="noopener">enterprise.jobo.world</a>.
+        </p>
+        <label for="apiKey">API key</label>
+        <input type="password" id="apiKey" placeholder="jbe_live_…" autocomplete="off" />
+        <button class="primary" id="saveKey">Save key</button>
+        <div class="status" id="setupStatus"></div>
+      </details>
     </div>
 
     <div id="main" style="display: none">
@@ -376,7 +402,14 @@
       <div class="status" id="status"></div>
 
       <hr />
-      <button class="link" id="changeKey">Use a different API key</button>
+      <p class="hint" id="connectedAs" style="margin: 0"></p>
+      <button class="link" id="disconnect">Disconnect</button>
+      <p class="hint" style="margin: 8px 0 0">
+        Disconnect removes the key from this add-on. If you signed in with Jobo, it also revokes that key and
+        removes the add-on from Developers → API Keys in the
+        <a href="https://enterprise.jobo.world/api-keys?src=sheets" target="_blank" rel="noopener">Jobo dashboard</a>.
+        A key you pasted keeps working until you revoke it there.
+      </p>
     </div>
 
     <script>
@@ -586,17 +619,141 @@
         return input ? input.value.trim() : '';
       }
 
+      // ── Sign in with Jobo ────────────────────────────────────────────────
+      // The server returns one authorization URL per attempt and keeps that
+      // attempt's PKCE verifier for an hour. An attempt works once, so the
+      // link gets a new URL after every click, and every 20 minutes while
+      // the sidebar sits open, which keeps the URL behind it far from expiry.
+      var SIGN_IN_REFRESH_MS = 20 * 60 * 1000;
+      // After a click the sidebar checks every 3 seconds for 5 minutes, then
+      // leaves it to "I have signed in".
+      var SIGN_IN_POLL_MS = 3000;
+      var SIGN_IN_POLL_LIMIT = 100;
+      /** Bumped whenever the setup view is entered or left; stale callbacks compare it and stop. */
+      var signInRun = 0;
+      var signInRefreshTimer = null;
+      var signInPollTimer = null;
+      var signInPolling = false;
+      var signInPollsLeft = 0;
+
+      function setSignInStatus(message) {
+        var box = el('signInStatus');
+        box.textContent = message;
+        box.className = message ? 'status err' : 'status';
+      }
+
+      function armSignIn() {
+        var run = signInRun;
+        serverCall('startSignIn')
+          .then(function (result) {
+            if (run !== signInRun) return;
+            var link = el('signIn');
+            link.href = result.url;
+            link.removeAttribute('aria-disabled');
+          })
+          .catch(function (err) {
+            // A link that is already armed still works; only a dead one is an error.
+            if (run === signInRun && !el('signIn').getAttribute('href')) {
+              setSignInStatus('Sign-in could not be started. ' + err.message);
+            }
+          });
+      }
+
+      function stopSignIn() {
+        signInRun++;
+        clearInterval(signInRefreshTimer);
+        clearTimeout(signInPollTimer);
+        signInRefreshTimer = null;
+        signInPollTimer = null;
+        signInPolling = false;
+        signInPollsLeft = 0;
+      }
+
+      /** Reset the setup view and arm the link. Runs each time the view is shown. */
+      function beginSignIn() {
+        var link = el('signIn');
+        link.removeAttribute('href');
+        link.setAttribute('aria-disabled', 'true');
+        el('signInWait').style.display = 'none';
+        setSignInStatus('');
+        armSignIn();
+        signInRefreshTimer = setInterval(armSignIn, SIGN_IN_REFRESH_MS);
+      }
+
+      /** Resolves true once a key is stored (and loads the main view), false while there is none. */
+      function checkConnection(run) {
+        return serverCall('getConnectionStatus').then(function (status) {
+          if (run !== signInRun) return true;
+          if (!status.connected) return false;
+          stopSignIn();
+          serverCall('getSettings').then(show);
+          return true;
+        });
+      }
+
+      function pollSignIn(run) {
+        if (run !== signInRun) return;
+        if (signInPollsLeft <= 0) {
+          signInPolling = false;
+          el('signInHint').textContent = 'This sidebar has stopped checking. Choose I have signed in when you are done.';
+          return;
+        }
+        signInPollsLeft--;
+        var again = function (done) {
+          if (done === true || run !== signInRun) return;
+          signInPollTimer = setTimeout(function () { pollSignIn(run); }, SIGN_IN_POLL_MS);
+        };
+        // A failed check is not an answer: try again on the next tick.
+        checkConnection(run).then(again, again);
+      }
+
       function show(settings) {
         STATE = settings;
+        stopSignIn();
         el('setup').style.display = settings.hasKey ? 'none' : 'block';
         el('main').style.display = settings.hasKey ? 'block' : 'none';
         if (settings.hasKey) {
+          el('connectedAs').textContent = settings.accountEmail
+            ? 'Connected as ' + settings.accountEmail + '.'
+            : 'Connected to Jobo.';
           renderChecks('workModels', settings.workModels);
           renderChecks('employmentTypes', settings.employmentTypes);
           renderChecks('experienceLevels', settings.experienceLevels);
           mountFilterBoxes();
+        } else {
+          beginSignIn();
         }
       }
+
+      el('signIn').addEventListener('click', function (event) {
+        if (!this.getAttribute('href')) {
+          event.preventDefault();
+          return;
+        }
+        // The click itself opens the tab. From here the sidebar waits for the
+        // callback there to store the key.
+        var run = signInRun;
+        setSignInStatus('');
+        el('signInHint').textContent = 'Finish signing in on the tab that opened. This sidebar connects on its own when you are done.';
+        el('signInWait').style.display = 'block';
+        signInPollsLeft = SIGN_IN_POLL_LIMIT;
+        if (!signInPolling) {
+          signInPolling = true;
+          signInPollTimer = setTimeout(function () { pollSignIn(run); }, SIGN_IN_POLL_MS);
+        }
+        // That URL is now spent: the next click needs an attempt of its own.
+        armSignIn();
+      });
+
+      el('checkSignIn').addEventListener('click', function () {
+        checkConnection(signInRun)
+          .then(function (done) {
+            if (!done) setSignInStatus('Not connected yet. Finish signing in on the Jobo tab, then check again.');
+          })
+          .catch(function (err) {
+            setSignInStatus(err.message);
+          });
+      });
 
       el('saveKey').addEventListener('click', function () {
         var button = this;
@@ -620,9 +777,17 @@
           });
       });
 
-      el('changeKey').addEventListener('click', function () {
-        serverCall('clearApiKey').then(function () {
-          serverCall('getSettings').then(show);
+      el('disconnect').addEventListener('click', function () {
+        serverCall('disconnect').then(function (result) {
+          serverCall('getSettings').then(function (settings) {
+            show(settings);
+            // Says whether a signed-in key was revoked at Jobo, or where to finish.
+            if (result && result.message) {
+              var box = el('setupStatus');
+              box.textContent = result.message;
+              box.className = result.revoked ? 'status ok' : 'status err';
+            }
+          });
         });
       });
 

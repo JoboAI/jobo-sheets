@@ -65,7 +65,47 @@ response body, taking the problem details and the credit headers with it.
 ## Storage
 
 The API key is stored in **user** properties, not document properties. Spreadsheets get shared, and a
-document property would hand the key to everyone it is shared with.
+document property would hand the key to everyone it is shared with. A key that came from signing in is
+stored the same way, with the account's email next to it so the sidebar can say who is connected.
+
+## Sign in with Jobo
+
+The sidebar's default way to connect. It is OAuth 2.0 authorization code with PKCE (S256) as a public
+client, written by hand in `Code.ts` with no library. There is no client secret. The access
+token that comes back is an ordinary Jobo API key: it goes through `saveApiKey()` like a pasted one, does
+not expire, and is never refreshed. Pasting a key stays available under **Paste an API key instead**.
+
+What Apps Script dictates:
+
+- **The redirect address** is `https://script.google.com/macros/d/{SCRIPT_ID}/usercallback`, built at run
+  time from `ScriptApp.getScriptId()`. The `state` value is an Apps Script state token that names the
+  callback function (`authCallback`); Apps Script checks it before calling the function.
+- **A sidebar cannot navigate the window**, so **Sign in with Jobo** is a link that opens a new tab. The
+  sidebar then polls `getConnectionStatus()` and also offers **I have signed in**.
+- **The PKCE verifier stays server-side**, in the user cache under an attempt id carried inside the state
+  token, and is removed when the callback runs.
+
+**Which client it signs in as.** The redirect address contains the script id, and Jobo compares it exactly.
+Before each sign-in `resolveOAuthClientId()` asks Jobo whether this script's address is registered for the
+client `google-sheets`:
+
+- **It is:** the add-on signs in as `google-sheets`, which the consent screen shows as a verified app. That
+  is the published add-on, once its address is set on the portal API as
+  `OpenIddict:Connectors:google-sheets:RedirectUris:0`. The script id in that address is the `scriptId` in
+  the `.clasp.json` that `clasp` writes for the deployed add-on project; it is not in this repository.
+- **It is not:** this is a copy in its own script project (anyone installing from the mirror, a test
+  deployment, or the published add-on before its address is registered). It registers itself once with
+  Jobo's client registration endpoint, keeps the client id in script properties, and signs in as that
+  client. The consent screen shows it as an unverified app named "Google Sheets (Career Site Jobs)" that
+  returns to `script.google.com`.
+
+So sign-in works for every copy without any server setting, and registering the published add-on's address
+only changes how it is shown. The answer is cached for an hour, so the change takes that long to show.
+
+`Disconnect` removes the key and the email from this add-on. After a sign-in it first hands the key back
+to Jobo (`POST /connect/revoke`), which revokes it and removes the add-on from the connected apps under
+**Developers → API Keys** in the Jobo dashboard. If Jobo cannot be reached, the sidebar says to disconnect
+the add-on there. A pasted key is never sent: it is removed from the add-on and keeps working.
 
 ## Development
 
@@ -91,6 +131,14 @@ messaging, query building, location formatting, sheet naming and the picker opti
 loop against a scripted fake of those services (the exact search body every filter produces, equal page
 sizes, API warnings in the message, and a failed later page still writing the pages already billed).
 Everything else needs a real deployment and a `jbe_test_` key.
+
+Sign in with Jobo is covered against scripted fakes only: the authorization URL, the challenge for a known
+verifier, self-registration, and every outcome of the callback. It has never run in Apps Script. To check
+in a real deployment, in this order: that `ScriptApp.newStateToken()` and `ScriptApp.getScriptId()` run
+under the three scopes above (if Apps Script asks for another scope, that is a scope addition, see the
+warning above); that script properties and the script cache are writable when the add-on runs for a user
+who installed it from the Marketplace; that the add-on's `/usercallback` reaches `authCallback` for such a
+user; and the full round trip, first as a self-registered copy and then with the address registered.
 
 ## Publishing
 

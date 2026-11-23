@@ -38,8 +38,11 @@ declare const UrlFetchApp: GoogleAppsScript.URL_Fetch.UrlFetchApp;
 declare const PropertiesService: GoogleAppsScript.Properties.PropertiesService;
 declare const Utilities: GoogleAppsScript.Utilities.Utilities;
 declare const CacheService: GoogleAppsScript.Cache.CacheService;
+declare const ScriptApp: GoogleAppsScript.Script.ScriptApp;
 
 const API_KEY_PROPERTY = "JOBO_API_KEY";
+/** The signed-in account's email, kept only to say who is connected. Absent for a pasted key. */
+const ACCOUNT_EMAIL_PROPERTY = "JOBO_ACCOUNT_EMAIL";
 const BASE_URL = "https://connect.jobo.world";
 const MAX_ATTEMPTS = 3;
 
@@ -186,7 +189,7 @@ export function describeFailure(status: number, body: unknown): string {
     return `Your Jobo wallet balance is too low for this import. ${detail ?? ""} Top up your wallet at enterprise.jobo.world, or import fewer jobs.`.trim();
   }
   if (status === 401 || status === 403) {
-    return "Jobo rejected the API key. Check it is current at https://enterprise.jobo.world/api-keys?src=sheets.";
+    return "Jobo rejected the API key. Click Disconnect at the bottom of the sidebar, then sign in again or paste a current key from https://enterprise.jobo.world/api-keys?src=sheets.";
   }
   if (status === 429) {
     return "Jobo rate limit reached. Wait a minute and try again.";
@@ -196,7 +199,7 @@ export function describeFailure(status: number, body: unknown): string {
 
 function apiKey(): string {
   const key = PropertiesService.getUserProperties().getProperty(API_KEY_PROPERTY) ?? "";
-  if (!key) throw new Error("No Jobo API key saved. Add one in the sidebar.");
+  if (!key) throw new Error("Not connected to Jobo. Sign in or add an API key in the sidebar.");
   return key;
 }
 
@@ -231,14 +234,18 @@ function showSidebar(): void {
 
 function getSettings(): {
   hasKey: boolean;
+  /** The signed-in account, when the key came from Sign in with Jobo. */
+  accountEmail: string | null;
   workModels: string[];
   employmentTypes: string[];
   experienceLevels: string[];
   companyCategories: string[];
   languages: Array<{ code: string; name: string }>;
 } {
+  const connection = getConnectionStatus();
   return {
-    hasKey: Boolean(PropertiesService.getUserProperties().getProperty(API_KEY_PROPERTY)),
+    hasKey: connection.connected,
+    accountEmail: connection.email,
     workModels: WORK_MODELS.slice(),
     employmentTypes: EMPLOYMENT_TYPES.slice(),
     experienceLevels: EXPERIENCE_LEVELS.slice(),
@@ -250,8 +257,13 @@ function getSettings(): {
 /**
  * Stored per-user, not per-document: spreadsheets get shared, and a document
  * property would hand the key to everyone it is shared with.
+ *
+ * The one way a key gets stored: the sidebar's pasted key and the key that
+ * Sign in with Jobo returns both come through here. A newly saved key drops
+ * the previous account's email and the app it was issued to; authCallback()
+ * sets them again after a sign-in.
  */
-function saveApiKey(key: string): { ok: boolean; message: string } {
+export function saveApiKey(key: string): { ok: boolean; message: string } {
   const trimmed = (key || "").trim();
   if (!isValidApiKeyFormat(trimmed)) {
     return {
@@ -260,12 +272,387 @@ function saveApiKey(key: string): { ok: boolean; message: string } {
         "That does not look like a Jobo API key. Keys start with jbe_live_ or jbe_test_ and are 74 characters long.",
     };
   }
-  PropertiesService.getUserProperties().setProperty(API_KEY_PROPERTY, trimmed);
+  const properties = PropertiesService.getUserProperties();
+  properties.setProperty(API_KEY_PROPERTY, trimmed);
+  properties.deleteProperty(ACCOUNT_EMAIL_PROPERTY);
+  properties.deleteProperty(OAUTH_CLIENT_PROPERTY);
   return { ok: true, message: "API key saved." };
 }
 
-function clearApiKey(): void {
-  PropertiesService.getUserProperties().deleteProperty(API_KEY_PROPERTY);
+/** Whether a key is stored, and whose account it is when the user signed in. */
+export function getConnectionStatus(): { connected: boolean; email: string | null } {
+  const properties = PropertiesService.getUserProperties();
+  const connected = Boolean(properties.getProperty(API_KEY_PROPERTY));
+  return { connected, email: connected ? properties.getProperty(ACCOUNT_EMAIL_PROPERTY) || null : null };
+}
+
+/**
+ * Disconnects the add-on. A key that Sign in with Jobo stored is handed back to
+ * Jobo first, which revokes it and removes the add-on from Developers → API
+ * Keys in the dashboard. A pasted key is the user's own: it is forgotten here
+ * and left alone at Jobo. The add-on is disconnected either way; `revoked` is
+ * false only when a signed-in key could not be handed back, and the message
+ * then says where to finish.
+ */
+export function disconnect(): { revoked: boolean; message: string } {
+  const properties = PropertiesService.getUserProperties();
+  const key = properties.getProperty(API_KEY_PROPERTY);
+  const clientId = properties.getProperty(OAUTH_CLIENT_PROPERTY);
+  const signedIn = Boolean(key && clientId);
+  const revoked = !signedIn || revokeKey(key as string, clientId as string);
+
+  properties.deleteProperty(API_KEY_PROPERTY);
+  properties.deleteProperty(ACCOUNT_EMAIL_PROPERTY);
+  properties.deleteProperty(OAUTH_CLIENT_PROPERTY);
+
+  if (!signedIn) return { revoked, message: "" };
+  return {
+    revoked,
+    message: revoked
+      ? "Disconnected. The key this add-on held has been revoked."
+      : "Disconnected here, but Jobo could not be reached to revoke the key. To finish, disconnect the add-on under Developers → API Keys in the Jobo dashboard.",
+  };
+}
+
+/** Hands a signed-in key back (RFC 7009). Jobo answers 200 whether or not the key was still live. */
+function revokeKey(key: string, clientId: string): boolean {
+  // UrlFetchApp throws on a network fault even with muteHttpExceptions.
+  try {
+    const response = UrlFetchApp.fetch(OAUTH_REVOKE_URL, {
+      method: "post",
+      contentType: "application/x-www-form-urlencoded",
+      headers: { "X-Jobo-Client": "sheets" },
+      // Jobo only revokes a key for the app it was issued to.
+      payload: buildQuery({ token: key, client_id: clientId }).slice(1),
+      muteHttpExceptions: true,
+    });
+    return response.getResponseCode() === 200;
+  } catch {
+    return false;
+  }
+}
+
+// ── Sign in with Jobo ────────────────────────────────────────────────────────
+//
+// OAuth 2.0 authorization code + PKCE (S256), as a public client: there is no
+// client secret, and the access token that comes back *is* a Jobo API key. It
+// is saved through saveApiKey(), so everything after sign-in is the pasted-key
+// path. The key does not expire and is never refreshed.
+//
+// What Apps Script dictates:
+//  - The redirect lands on /usercallback, which Apps Script serves for every
+//    script project. The `state` token it issues names the function to run, and
+//    Apps Script rejects a forged or expired token before that function is called.
+//  - A sidebar cannot navigate the top window, so the sidebar shows the
+//    authorization URL as a link that opens a new tab, then polls
+//    getConnectionStatus() until authCallback() has stored the key.
+
+const OAUTH_AUTHORIZE_URL = "https://enterprise.jobo.world/connect/authorize";
+const OAUTH_TOKEN_URL = "https://enterprise.jobo.world/connect/token";
+/** Says whether a client has a given redirect address registered. Public, no credentials. */
+const OAUTH_CLIENT_LOOKUP_URL = "https://enterprise.jobo.world/api/auth/oauth/client";
+const OAUTH_REGISTER_URL = "https://enterprise.jobo.world/connect/register";
+const OAUTH_REVOKE_URL = "https://enterprise.jobo.world/connect/revoke";
+/** The client Jobo registered for the published add-on. */
+const OAUTH_CLIENT_ID = "google-sheets";
+/** The client a copy of the add-on registered for itself: JSON `{ clientId, redirectUri }`, per script project. */
+const SELF_REGISTERED_CLIENT_PROPERTY = "JOBO_OAUTH_SELF_CLIENT";
+/**
+ * User property: the app the stored key was issued to by a sign-in. Absent for
+ * a pasted key. It is what lets disconnect() hand the key back.
+ */
+const OAUTH_CLIENT_PROPERTY = "JOBO_OAUTH_CLIENT";
+const SELF_REGISTERED_CLIENT_NAME = "Google Sheets (Career Site Jobs)";
+const RESOLVED_CLIENT_CACHE_KEY = "jobo_oauth_client";
+const SIGN_IN_UNAVAILABLE = "Jobo could not be reached to start signing in. Try again, or paste an API key.";
+const OAUTH_SCOPE = "api email";
+/** The name authCallback is registered under on globalThis (see the end of this file). */
+const OAUTH_CALLBACK_FUNCTION = "authCallback";
+/**
+ * How long one sign-in link works: the state token's documented maximum. The
+ * sidebar asks for a fresh link well inside it, so a link is never near expiry
+ * when it is clicked.
+ */
+const SIGN_IN_TIMEOUT_SECONDS = 3600;
+const VERIFIER_CACHE_PREFIX = "jobo_oauth_verifier_";
+const CALLBACK_PAGE_TITLE = "Career Site Jobs – Jobo";
+const TRY_AGAIN_HINT = "Close this tab, then choose Sign in with Jobo in the sidebar to try again.";
+
+/**
+ * The redirect URI the Jobo server must have registered for `google-sheets`.
+ * It is compared exactly, so it is always built from this script's own id.
+ */
+export function oauthRedirectUri(): string {
+  return `https://script.google.com/macros/d/${ScriptApp.getScriptId()}/usercallback`;
+}
+
+/**
+ * A PKCE code verifier: 96 hex characters from three random UUIDs, inside the
+ * 43 to 128 unreserved characters RFC 7636 allows, with 366 random bits. Apps
+ * Script has no crypto.getRandomValues; Utilities.getUuid() is documented as
+ * java.util.UUID.randomUUID(), which draws from a cryptographically strong
+ * generator.
+ */
+export function createCodeVerifier(): string {
+  return [Utilities.getUuid(), Utilities.getUuid(), Utilities.getUuid()].join("").replace(/-/g, "");
+}
+
+/** The S256 challenge: BASE64URL(SHA-256(verifier)) without padding. */
+export function codeChallenge(verifier: string): string {
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, verifier, Utilities.Charset.US_ASCII);
+  return Utilities.base64EncodeWebSafe(digest).replace(/=+$/, "");
+}
+
+/**
+ * Which OAuth client this copy of the add-on signs in as.
+ *
+ * The redirect address contains the script id, and Jobo compares it exactly.
+ * The published add-on is one script project, whose address Jobo has
+ * registered for `google-sheets`. A copy installed from the source is a
+ * different script project with an address Jobo cannot know in advance, so it
+ * registers itself once (RFC 7591) and signs in as that client; the consent
+ * screen then shows it as an unverified app, which is what it is.
+ *
+ * The registration is kept in script properties: one per script project,
+ * whoever the user is. Signing in again as the same client returns the same key.
+ */
+export function resolveOAuthClientId(redirectUri: string): string {
+  // The sidebar asks for a fresh sign-in link while it waits; the answer does
+  // not change between two of those, so it is remembered for an hour.
+  const cache = CacheService.getScriptCache();
+  const remembered = (cache.get(RESOLVED_CLIENT_CACHE_KEY) || "").split("\n");
+  if (remembered.length === 2 && remembered[0] === redirectUri && remembered[1]) return remembered[1];
+
+  const clientId = lookUpOAuthClientId(redirectUri);
+  cache.put(RESOLVED_CLIENT_CACHE_KEY, `${redirectUri}\n${clientId}`, SIGN_IN_TIMEOUT_SECONDS);
+  return clientId;
+}
+
+function lookUpOAuthClientId(redirectUri: string): string {
+  if (isRedirectRegistered(OAUTH_CLIENT_ID, redirectUri)) return OAUTH_CLIENT_ID;
+
+  const properties = PropertiesService.getScriptProperties();
+  try {
+    const saved = JSON.parse(properties.getProperty(SELF_REGISTERED_CLIENT_PROPERTY) || "null") as {
+      clientId?: unknown;
+      redirectUri?: unknown;
+    } | null;
+    if (saved && typeof saved.clientId === "string" && saved.clientId && saved.redirectUri === redirectUri) {
+      return saved.clientId;
+    }
+  } catch {
+    // Unreadable: register again below.
+  }
+
+  const clientId = registerOAuthClient(redirectUri);
+  properties.setProperty(SELF_REGISTERED_CLIENT_PROPERTY, JSON.stringify({ clientId, redirectUri }));
+  return clientId;
+}
+
+/** True when Jobo has `redirectUri` registered for `clientId`. An unknown client answers 404. */
+function isRedirectRegistered(clientId: string, redirectUri: string): boolean {
+  let response: GoogleAppsScript.URL_Fetch.HTTPResponse;
+  try {
+    response = UrlFetchApp.fetch(OAUTH_CLIENT_LOOKUP_URL + buildQuery({ client_id: clientId, redirect_uri: redirectUri }), {
+      method: "get",
+      headers: { Accept: "application/json", "X-Jobo-Client": "sheets" },
+      muteHttpExceptions: true,
+    });
+  } catch {
+    throw new Error(SIGN_IN_UNAVAILABLE);
+  }
+  const status = response.getResponseCode();
+  if (status === 404) return false;
+  if (status < 200 || status >= 300) throw new Error(SIGN_IN_UNAVAILABLE);
+  try {
+    const body = JSON.parse(response.getContentText()) as { redirect_host?: unknown } | null;
+    // The host is echoed back only for an address the client registered.
+    return Boolean(body && typeof body.redirect_host === "string" && body.redirect_host);
+  } catch {
+    return false;
+  }
+}
+
+function registerOAuthClient(redirectUri: string): string {
+  let response: GoogleAppsScript.URL_Fetch.HTTPResponse;
+  try {
+    response = UrlFetchApp.fetch(OAUTH_REGISTER_URL, {
+      method: "post",
+      contentType: "application/json",
+      headers: { Accept: "application/json", "X-Jobo-Client": "sheets" },
+      payload: JSON.stringify({ client_name: SELF_REGISTERED_CLIENT_NAME, redirect_uris: [redirectUri] }),
+      muteHttpExceptions: true,
+    });
+  } catch {
+    throw new Error(SIGN_IN_UNAVAILABLE);
+  }
+  let clientId: unknown;
+  try {
+    clientId = (JSON.parse(response.getContentText()) as { client_id?: unknown } | null)?.client_id;
+  } catch {
+    clientId = undefined;
+  }
+  const status = response.getResponseCode();
+  if (status < 200 || status >= 300 || typeof clientId !== "string" || !clientId) {
+    throw new Error(SIGN_IN_UNAVAILABLE);
+  }
+  return clientId;
+}
+
+/**
+ * Starts one sign-in attempt and returns the authorization URL for the sidebar
+ * to show as a link.
+ *
+ * The verifier never leaves the server: it waits in the user cache under the
+ * attempt's id, and that id travels inside the state token, which only Apps
+ * Script can read or mint. The cache is per user and expires on its own, so an
+ * abandoned attempt leaves nothing behind. (CacheService may evict early when a
+ * lot is cached; that attempt then fails cleanly and the user signs in again.)
+ */
+export function startSignIn(): { url: string } {
+  const clientId = resolveOAuthClientId(oauthRedirectUri());
+  const attempt = Utilities.getUuid();
+  const verifier = createCodeVerifier();
+  CacheService.getUserCache().put(VERIFIER_CACHE_PREFIX + attempt, verifier, SIGN_IN_TIMEOUT_SECONDS);
+
+  // The client rides in the state token too: the token request must name the
+  // client the code was issued to, and only Apps Script can mint or alter a token.
+  const state = ScriptApp.newStateToken()
+    .withMethod(OAUTH_CALLBACK_FUNCTION)
+    .withArgument("attempt", attempt)
+    .withArgument("client", clientId)
+    .withTimeout(SIGN_IN_TIMEOUT_SECONDS)
+    .createToken();
+
+  return {
+    url:
+      OAUTH_AUTHORIZE_URL +
+      buildQuery({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: oauthRedirectUri(),
+        scope: OAUTH_SCOPE,
+        state,
+        code_challenge: codeChallenge(verifier),
+        code_challenge_method: "S256",
+      }),
+  };
+}
+
+/** What Apps Script hands the callback: the query parameters plus the state token's arguments. */
+export interface SignInCallbackRequest {
+  parameter?: Record<string, string | undefined>;
+}
+
+/** The tab the user lands on after Jobo redirects back. It never shows the key. */
+function signInPage(ok: boolean, heading: string, message: string, hint: string): GoogleAppsScript.HTML.HtmlOutput {
+  // Callback.html prints these with printing scriptlets, which escape them: the
+  // message can be an error_description taken straight from the query string.
+  const template = HtmlService.createTemplateFromFile("Callback");
+  template.ok = ok;
+  template.heading = heading;
+  template.message = message;
+  template.hint = hint;
+  return template.evaluate().setTitle(CALLBACK_PAGE_TITLE);
+}
+
+function signInFailed(message: string, hint: string = TRY_AGAIN_HINT): GoogleAppsScript.HTML.HtmlOutput {
+  return signInPage(false, "Sign-in failed", message, hint);
+}
+
+/**
+ * Runs when Jobo redirects the browser back to /usercallback. Apps Script has
+ * already checked the state token by the time this is called, and passes the
+ * token's `attempt` argument alongside the query parameters.
+ *
+ * The attempt must still have a verifier waiting in this user's cache. A
+ * callback for an unknown, expired or already finished attempt fails here, and
+ * PKCE means a code issued for any other attempt would be refused by the token
+ * endpoint anyway.
+ */
+export function authCallback(request: SignInCallbackRequest): GoogleAppsScript.HTML.HtmlOutput {
+  const params = request?.parameter ?? {};
+
+  // One use: whatever happens below, this attempt is over.
+  const cache = CacheService.getUserCache();
+  const attempt = params.attempt ?? "";
+  const verifier = attempt ? cache.get(VERIFIER_CACHE_PREFIX + attempt) : null;
+  if (attempt) cache.remove(VERIFIER_CACHE_PREFIX + attempt);
+
+  if (params.error) {
+    // access_denied is the user declining on the consent screen.
+    const cancelled = params.error === "access_denied";
+    const description =
+      params.error_description ||
+      (cancelled ? "Access to your Jobo account was not approved." : `Jobo returned the error ${params.error}.`);
+    return signInPage(false, cancelled ? "Sign-in was cancelled" : "Sign-in failed", description, TRY_AGAIN_HINT);
+  }
+  if (!params.code) return signInFailed("Jobo did not return an authorization code.");
+  if (!verifier) {
+    return signInFailed(
+      "This sign-in link has expired or was already used.",
+      "Close this tab and check the sidebar. If it is not connected, choose Sign in with Jobo again.",
+    );
+  }
+
+  // UrlFetchApp throws on a network fault even with muteHttpExceptions.
+  let response: GoogleAppsScript.URL_Fetch.HTTPResponse;
+  try {
+    response = UrlFetchApp.fetch(OAUTH_TOKEN_URL, {
+      method: "post",
+      contentType: "application/x-www-form-urlencoded",
+      headers: { Accept: "application/json", "X-Jobo-Client": "sheets" },
+      // A public client: sending a client_secret makes the server answer invalid_client.
+      payload: buildQuery({
+        grant_type: "authorization_code",
+        client_id: params.client || OAUTH_CLIENT_ID,
+        redirect_uri: oauthRedirectUri(),
+        code: params.code,
+        code_verifier: verifier,
+      }).slice(1),
+      muteHttpExceptions: true,
+    });
+  } catch {
+    return signInFailed("Jobo could not be reached to finish signing in.");
+  }
+
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(response.getContentText());
+    if (parsed && typeof parsed === "object") body = parsed as Record<string, unknown>;
+  } catch {
+    // Not JSON: handled below as a failed exchange or a missing key.
+  }
+
+  const status = response.getResponseCode();
+  if (status < 200 || status >= 300) {
+    const description = typeof body.error_description === "string" ? body.error_description : "";
+    return signInFailed(description || `Jobo returned HTTP ${status}.`);
+  }
+
+  // The access token is a Jobo API key, so it is stored exactly like a pasted one.
+  const saved = saveApiKey(typeof body.access_token === "string" ? body.access_token : "");
+  if (!saved.ok) {
+    return signInFailed(
+      "Jobo did not return a valid API key.",
+      "Close this tab and try again from the sidebar. You can also paste an API key there.",
+    );
+  }
+
+  const userProperties = PropertiesService.getUserProperties();
+  // The app the key was issued to; see disconnect().
+  userProperties.setProperty(OAUTH_CLIENT_PROPERTY, params.client || OAUTH_CLIENT_ID);
+
+  // Present only when the email scope was granted.
+  const email = typeof body.account_email === "string" ? body.account_email.trim() : "";
+  if (email) userProperties.setProperty(ACCOUNT_EMAIL_PROPERTY, email);
+
+  return signInPage(
+    true,
+    "Connected to Jobo",
+    email ? `Your Jobo account ${email} is connected.` : "Your Jobo account is connected.",
+    "You can close this tab and return to your spreadsheet.",
+  );
 }
 
 // v2: added skills and the job category/subcategory options.
@@ -725,7 +1112,13 @@ globals.onHomepage = onHomepage;
 globals.showSidebar = showSidebar;
 globals.getSettings = getSettings;
 globals.saveApiKey = saveApiKey;
-globals.clearApiKey = clearApiKey;
+globals.getConnectionStatus = getConnectionStatus;
+globals.disconnect = disconnect;
+// The name a sidebar opened before this version still calls.
+globals.clearApiKey = disconnect;
+globals.startSignIn = startSignIn;
+// Called by Apps Script at /usercallback; the name is OAUTH_CALLBACK_FUNCTION.
+globals.authCallback = authCallback;
 globals.getFilterOptions = getFilterOptions;
 globals.suggestLocations = suggestLocations;
 globals.suggestCompanies = suggestCompanies;

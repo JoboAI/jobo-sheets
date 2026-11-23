@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      /* @inline:tokens.css */
+
+      /*
+       * The tab Jobo redirects back to after Sign in with Jobo. Same type,
+       * eyebrow and status box as the sidebar, in one narrow centred column.
+       *
+       * This file is an Apps Script template: Code.ts sets ok, heading,
+       * message and hint, and the printing scriptlets below escape them. Keep
+       * scriptlet tags out of comments, since the template engine runs them
+       * wherever they appear.
+       */
+      body {
+        font-family: var(--jobo-font-sans);
+        font-size: 13px;
+        color: var(--jobo-ink-800);
+        background: #fff;
+        margin: 0;
+        padding: 48px 14px;
+      }
+      main {
+        max-width: 300px;
+        margin: 0 auto;
+      }
+      h2 {
+        font-family: var(--jobo-font-sans);
+        font-size: 15px;
+        font-weight: 500;
+        letter-spacing: -0.01em;
+        color: var(--jobo-ink-900);
+        margin: 0 0 4px;
+      }
+      .eyebrow {
+        font-family: var(--jobo-font-mono);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--jobo-ink-600);
+        margin: 0 0 6px;
+      }
+      p.hint {
+        color: var(--jobo-ink-600);
+        font-size: 12px;
+        margin: 12px 0 0;
+        line-height: 1.45;
+      }
+      .status {
+        margin-top: 12px;
+        padding: 8px 10px;
+        border-radius: 0;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .status.ok {
+        background: var(--jobo-success-tint);
+        color: var(--jobo-success-fg);
+      }
+      .status.err {
+        background: var(--jobo-critical-tint);
+        color: var(--jobo-critical-fg);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Connection</p>
+      <h2><?= heading ?></h2>
+      <? if (ok) { ?>
+      <div class="status ok"><?= message ?></div>
+      <? } else { ?>
+      <div class="status err"><?= message ?></div>
+      <? } ?>
+      <p class="hint"><?= hint ?></p>
+    </main>
+  </body>
+</html>
