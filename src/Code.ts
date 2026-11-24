@@ -11,17 +11,27 @@
  *    and there is no guarantee the microtask queue drains before the call
  *    returns. Rather than paper over that with a spin-wait, this file mirrors
  *    connector-core's error semantics against a blocking `UrlFetchApp` call.
- *    The shared behaviour that matters — which statuses are terminal — is
- *    reproduced explicitly below and covered by tests.
+ *    Whether a failure is retried, and how long to wait, is still decided by
+ *    connector-core (`isRetryable`, `nextDelayMs`), so the policy cannot drift.
+ *  - **A run ends after 6 minutes.** An import writes each page as it arrives
+ *    and stops starting new work after `IMPORT_TIME_BUDGET_MS`.
  */
 
 import {
   COMPANY_CATEGORIES,
   EMPLOYMENT_TYPES,
   EXPERIENCE_LEVELS,
+  FeedCursorRestartRequiredError,
+  InsufficientCreditsError,
+  JoboApiError,
+  JoboTransportError,
   LANGUAGES,
+  RateLimitError,
   WORK_MODELS,
+  defaultRetryOptions,
+  isRetryable,
   isValidApiKeyFormat,
+  nextDelayMs,
   toJobSearchBody,
   type CompanySuggestion,
   type Job,
@@ -91,18 +101,44 @@ export interface ApiResult {
 }
 
 /**
- * Which statuses are worth another attempt.
- *
- * Mirrors connector-core's `isRetryable`. The two deliberate exclusions are the
- * ones that look retryable and are not: 402, because the balance check prices
- * the requested page size so a retry fails identically, and 409
- * `feed_cursor_restart_required`, because a void cursor can never be replayed.
+ * A failed response as the error connector-core's client would throw for it,
+ * so the core's own `isRetryable` and `nextDelayMs` decide what happens next.
+ * The class matters: 402 and a void feed cursor are never retried, and a 429
+ * always is.
  */
-export function isRetryableStatus(status: number, code: string | null): boolean {
-  if (status === 402) return false;
-  if (status === 409 && code === "feed_cursor_restart_required") return false;
-  if (status === 401 || status === 403) return false;
-  return status === 0 || status === 408 || status === 429 || status >= 500;
+export function toCoreError(result: Pick<ApiResult, "status" | "body" | "retryAfterSeconds">): JoboApiError {
+  const body = result.body;
+  const code =
+    body && typeof body === "object" && typeof (body as Record<string, unknown>).code === "string"
+      ? ((body as Record<string, unknown>).code as string)
+      : null;
+  const base = {
+    status: result.status,
+    message: `Jobo returned HTTP ${result.status}.`,
+    code,
+    body,
+    retryAfterSeconds: result.retryAfterSeconds,
+  };
+  if (result.status === 402) return new InsufficientCreditsError(base);
+  if (result.status === 409 && code === "feed_cursor_restart_required") return new FeedCursorRestartRequiredError(base);
+  if (result.status === 429) return new RateLimitError(base);
+  return new JoboApiError(base);
+}
+
+/**
+ * Whether a failed response is worth another attempt: connector-core's policy.
+ *
+ * `replaySafe: false` is a request billed for what it returns (the search).
+ * The API charges before it answers, so a lost answer may already have been
+ * paid for; such a request is replayed only on a 429 or a 503 that carries
+ * `Retry-After`. A 503 without it is a search that ran out of time, and the
+ * same search runs out of time again, so it is never retried either way.
+ */
+export function isRetryableResponse(
+  result: Pick<ApiResult, "status" | "body" | "retryAfterSeconds">,
+  replaySafe: boolean,
+): boolean {
+  return isRetryable(toCoreError(result), { retryRateLimit: true, replaySafe });
 }
 
 function readNumber(headers: Record<string, string>, name: string): number | null {
@@ -112,68 +148,105 @@ function readNumber(headers: Record<string, string>, name: string): number | nul
   return isFinite(parsed) ? parsed : null;
 }
 
+/** connector-core's backoff settings, with the longest single wait kept short for a 6-minute run. */
+const RETRY_TIMING = {
+  ...defaultRetryOptions,
+  maxAttempts: MAX_ATTEMPTS,
+  maxDelayMs: 30_000,
+  // nextDelayMs never sleeps; the add-on waits with Utilities.sleep below.
+  sleep: () => Promise.resolve(),
+};
+
+export interface RequestOptions {
+  /**
+   * False for a request billed for what it returns. Default true: every other
+   * endpoint this add-on calls is free.
+   */
+  replaySafe?: boolean;
+  /** Epoch ms. No retry is started whose wait would end after it. */
+  deadline?: number;
+}
+
+/** One HTTP attempt. Throws only when there is no response at all (UrlFetchApp's network faults). */
+function fetchOnce(path: string, apiKey: string, json: unknown): ApiResult {
+  // muteHttpExceptions is essential: without it Apps Script throws on any
+  // non-2xx and the body — carrying the problem details and credit headers —
+  // is lost, so nothing could be mapped to a useful message.
+  const response = UrlFetchApp.fetch(`${BASE_URL}${path}`, {
+    method: json === undefined ? "get" : "post",
+    // X-Jobo-Client is how the API attributes this traffic to the add-on;
+    // Apps Script owns the User-Agent and will not let us set one.
+    headers: { "X-Api-Key": apiKey, Accept: "application/json", "X-Jobo-Client": "sheets" },
+    ...(json === undefined ? {} : { contentType: "application/json", payload: JSON.stringify(json) }),
+    muteHttpExceptions: true,
+  });
+
+  const rawHeaders = response.getAllHeaders() as Record<string, string | string[]>;
+  const headers: Record<string, string> = {};
+  for (const key of Object.keys(rawHeaders)) {
+    const value = rawHeaders[key];
+    headers[key.toLowerCase()] = Array.isArray(value) ? value.join(", ") : String(value);
+  }
+
+  let body: unknown = null;
+  const text = response.getContentText();
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
+
+  // Like the core client: the header first, then a retry_after_seconds body field.
+  const bodyRetryAfter =
+    body && typeof body === "object" && typeof (body as Record<string, unknown>).retry_after_seconds === "number"
+      ? ((body as Record<string, unknown>).retry_after_seconds as number)
+      : null;
+
+  return {
+    status: response.getResponseCode(),
+    body,
+    creditsDeducted: readNumber(headers, "x-credits-deducted"),
+    creditsBalance: readNumber(headers, "x-credits-balance"),
+    quotaLimit: readNumber(headers, "x-quota-limit"),
+    quotaRemaining: readNumber(headers, "x-quota-remaining"),
+    retryAfterSeconds: readNumber(headers, "retry-after") ?? bodyRetryAfter,
+  };
+}
+
 /**
  * One blocking request, with connector-core's retry policy applied. A `json`
  * body makes it a JSON POST (the search endpoint); otherwise a GET.
+ *
+ * Returns the last response, failed or not. Throws when the last attempt got
+ * no response at all, and at once for a request that is not replay safe: the
+ * charge may have been made before the connection dropped.
  */
-function request(path: string, apiKey: string, json?: unknown): ApiResult {
-  let last: ApiResult | null = null;
+function request(path: string, apiKey: string, json?: unknown, options: RequestOptions = {}): ApiResult {
+  const replaySafe = options.replaySafe !== false;
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    // muteHttpExceptions is essential: without it Apps Script throws on any
-    // non-2xx and the body — carrying the problem details and credit headers —
-    // is lost, so nothing could be mapped to a useful message.
-    const response = UrlFetchApp.fetch(`${BASE_URL}${path}`, {
-      method: json === undefined ? "get" : "post",
-      // X-Jobo-Client is how the API attributes this traffic to the add-on;
-      // Apps Script owns the User-Agent and will not let us set one.
-      headers: { "X-Api-Key": apiKey, Accept: "application/json", "X-Jobo-Client": "sheets" },
-      ...(json === undefined ? {} : { contentType: "application/json", payload: JSON.stringify(json) }),
-      muteHttpExceptions: true,
-    });
-
-    const rawHeaders = response.getAllHeaders() as Record<string, string | string[]>;
-    const headers: Record<string, string> = {};
-    for (const key of Object.keys(rawHeaders)) {
-      const value = rawHeaders[key];
-      headers[key.toLowerCase()] = Array.isArray(value) ? value.join(", ") : String(value);
+  for (let attempt = 1; ; attempt++) {
+    let result: ApiResult | null = null;
+    let error: JoboApiError | JoboTransportError;
+    try {
+      result = fetchOnce(path, apiKey, json);
+      if (result.status >= 200 && result.status < 300) return result;
+      error = toCoreError(result);
+    } catch (thrown) {
+      const reason = thrown instanceof Error ? thrown.message : String(thrown);
+      error = new JoboTransportError(`Jobo could not be reached: ${reason}`, thrown);
     }
 
-    let body: unknown = null;
-    const text = response.getContentText();
-    if (text) {
-      try {
-        body = JSON.parse(text);
-      } catch {
-        body = text;
-      }
+    const retry = attempt < MAX_ATTEMPTS && isRetryable(error, { retryRateLimit: true, replaySafe });
+    const waitMs = retry ? nextDelayMs(error, attempt, RETRY_TIMING) : 0;
+    const inTime = options.deadline == null || Date.now() + waitMs < options.deadline;
+    if (!retry || !inTime) {
+      if (result) return result;
+      throw error;
     }
-
-    const status = response.getResponseCode();
-    const code =
-      body && typeof body === "object" && typeof (body as Record<string, unknown>).code === "string"
-        ? ((body as Record<string, unknown>).code as string)
-        : null;
-
-    last = {
-      status,
-      body,
-      creditsDeducted: readNumber(headers, "x-credits-deducted"),
-      creditsBalance: readNumber(headers, "x-credits-balance"),
-      quotaLimit: readNumber(headers, "x-quota-limit"),
-      quotaRemaining: readNumber(headers, "x-quota-remaining"),
-      retryAfterSeconds: readNumber(headers, "retry-after"),
-    };
-
-    if (status >= 200 && status < 300) return last;
-    if (!isRetryableStatus(status, code) || attempt === MAX_ATTEMPTS) return last;
-
-    // Honour Retry-After literally when present, otherwise exponential backoff.
-    const waitMs = last.retryAfterSeconds != null ? last.retryAfterSeconds * 1000 : 1000 * Math.pow(2, attempt - 1);
-    Utilities.sleep(Math.min(waitMs, 30000));
+    Utilities.sleep(waitMs);
   }
-
-  return last as ApiResult;
 }
 
 /** Human-readable message for a failed call. */
@@ -215,14 +288,21 @@ export function buildQuery(params: Record<string, string | number | undefined>):
 }
 
 // ── UI entry points ──────────────────────────────────────────────────────────
+//
+// This is an editor add-on: a menu under Extensions and an HTML sidebar. The
+// manifest therefore has no `addOns` section; that section, and its homepage
+// trigger that must return Cards, belong to Google Workspace add-ons.
+//
+// onOpen and onInstall can run before the user has authorised the add-on in
+// this file (AuthMode.NONE), so they only build the menu.
 
 function onOpen(): void {
   SpreadsheetApp.getUi().createAddonMenu().addItem("Import jobs…", "showSidebar").addToUi();
 }
 
-function onHomepage(): unknown {
-  showSidebar();
-  return null;
+/** Installing from the Marketplace does not run onOpen for the file already open. */
+function onInstall(): void {
+  onOpen();
 }
 
 function showSidebar(): void {
@@ -988,28 +1068,45 @@ export function importPageSize(limit: number): number {
 }
 
 /**
- * Every page is billed as it is delivered, so a failure on a later page (a 402
- * once the wallet runs dry, or a 429/5xx that outlasted the retries) must not
- * throw away the pages already fetched: they are written, and the message says
- * how far the import got and why it stopped.
+ * How long an import keeps starting new work: about 4.5 of Apps Script's 6
+ * minutes per run. A page started just before it, with a retry, still ends
+ * well inside the limit; a run that hits the limit is killed mid-page.
+ */
+export const IMPORT_TIME_BUDGET_MS = 270_000;
+
+/**
+ * Every page is billed as it is delivered, so each page is written to the sheet
+ * as soon as it arrives. A failure on a later page (a 402 once the wallet runs
+ * dry, a 429 that outlasted the retries, or a search that cannot be retried)
+ * keeps the pages already written, and the message says how far the import got
+ * and why it stopped. So does running out of time: the import stops starting
+ * pages after IMPORT_TIME_BUDGET_MS rather than be killed with a page billed
+ * and not written.
  */
 export function importJobs(req: ImportRequest): { ok: boolean; message: string } {
   try {
     const key = apiKey();
     const limit = Math.min(Math.max(req.limit ?? 100, 1), 1000);
+    const deadline = Date.now() + IMPORT_TIME_BUDGET_MS;
 
-    const jobs: Job[] = [];
+    const sheet = importSheet();
     let page = 1;
     let creditsSpent = 0;
     let balance: number | null = null;
     let quotaLimit: number | null = null;
     let quotaRemaining: number | null = null;
     let failure: string | null = null;
+    let outOfTime = false;
     const notes: string[] = [];
     const filters = toSearchFilters(req);
     const pageSize = importPageSize(limit);
 
-    while (jobs.length < limit) {
+    while (sheet.written() < limit) {
+      if (page > 1 && Date.now() >= deadline) {
+        outOfTime = true;
+        break;
+      }
+
       // POST /api/jobs/search: the include/exclude and taxonomy filters exist
       // only on the body surface. toJobSearchBody drops empty values, so an
       // untouched picker never becomes a filter.
@@ -1023,11 +1120,12 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
         include_fields: [],
       });
 
-      // UrlFetchApp throws on network faults even with muteHttpExceptions, so a
-      // thrown page stops the loop the same way a failed status does.
+      // The search is billed per job returned, so it is never replayed after a
+      // lost answer (see request()). A page that got no answer at all throws,
+      // and stops the loop the same way a failed status does.
       let result: ApiResult;
       try {
-        result = request("/api/jobs/search", key, body);
+        result = request("/api/jobs/search", key, body, { replaySafe: false, deadline });
       } catch (err) {
         failure = (err as Error).message;
         break;
@@ -1046,22 +1144,27 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
 
       const data = result.body as { jobs?: Job[]; total_pages?: number };
       const batch = data.jobs ?? [];
-      for (const job of batch) jobs.push(job);
+      // Equal pages can overshoot the limit by a few jobs; never write more.
+      try {
+        sheet.append(batch.slice(0, limit - sheet.written()));
+      } catch (err) {
+        failure = `Writing to the sheet failed: ${(err as Error).message}`;
+        break;
+      }
 
       if (batch.length === 0 || page >= (data.total_pages ?? 1)) break;
       page++;
     }
-    // Equal pages can overshoot the limit by a few jobs; never write more.
-    if (jobs.length > limit) jobs.length = limit;
 
+    const written = sheet.written();
     const note = notes.length > 0 ? ` Note: ${notes.join(" ")}` : "";
-    if (jobs.length === 0) {
+    if (written === 0) {
       return failure != null
         ? { ok: false, message: failure }
         : { ok: true, message: `No jobs matched those filters.${note}` };
     }
 
-    writeSheet(jobs);
+    sheet.finish();
 
     const cost = creditsSpent > 0 ? ` Cost: $${(creditsSpent / 1000).toFixed(2)} (${creditsSpent} credits).` : "";
     const left = balance != null ? ` Wallet balance: $${(balance / 1000).toFixed(2)}.` : "";
@@ -1071,26 +1174,60 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
     if (failure != null) {
       return {
         ok: false,
-        message: `Imported ${jobs.length} of the ${limit} jobs requested before the import stopped. ${failure}${cost}${left}${included}${note}`,
+        message: `Imported ${written} of the ${limit} jobs requested before the import stopped. ${failure}${cost}${left}${included}${note}`,
       };
     }
-    return { ok: true, message: `Imported ${jobs.length} jobs.${cost}${left}${included}${note}` };
+    if (outOfTime) {
+      return {
+        ok: false,
+        message:
+          `Imported ${written} of the ${limit} jobs requested. The import stopped early to finish inside ` +
+          `Google's 6-minute limit for one run. Importing again starts from the first matching job and bills ` +
+          `again for the jobs already imported.${cost}${left}${included}${note}`,
+      };
+    }
+    return { ok: true, message: `Imported ${written} jobs.${cost}${left}${included}${note}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };
   }
 }
 
-function writeSheet(jobs: Job[]): void {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = spreadsheet.insertSheet(uniqueSheetName(spreadsheet, "Jobo Jobs"));
+/**
+ * The sheet one import writes to, created with its header row when the first
+ * job arrives. Each append is one setValues call followed by a flush, so a page
+ * is in the spreadsheet before the next one is requested: a run that is killed
+ * or fails later keeps every page it was billed for.
+ */
+function importSheet(): { append: (jobs: Job[]) => void; finish: () => void; written: () => number } {
+  let sheet: GoogleAppsScript.Spreadsheet.Sheet | null = null;
+  let written = 0;
 
-  const rows: Array<Array<string | number>> = [COLUMNS.map((c) => c.header)];
-  for (const job of jobs) rows.push(COLUMNS.map((c) => neutralizeFormula(c.value(job))));
+  return {
+    written: () => written,
+    append(jobs: Job[]): void {
+      if (jobs.length === 0) return;
+      const rows: Array<Array<string | number>> = [];
+      // Header and first page in one write; formatted now, not at the end, so
+      // a sheet left by a killed run still reads as a table.
+      if (!sheet) rows.push(COLUMNS.map((c) => c.header));
+      for (const job of jobs) rows.push(COLUMNS.map((c) => neutralizeFormula(c.value(job))));
 
-  sheet.getRange(1, 1, rows.length, COLUMNS.length).setValues(rows);
-  sheet.getRange(1, 1, 1, COLUMNS.length).setFontWeight("bold");
-  sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, COLUMNS.length);
+      const firstRow = sheet ? written + 2 : 1;
+      if (!sheet) {
+        const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+        sheet = spreadsheet.insertSheet(uniqueSheetName(spreadsheet, "Jobo Jobs"));
+        sheet.setFrozenRows(1);
+      }
+      sheet.getRange(firstRow, 1, rows.length, COLUMNS.length).setValues(rows);
+      if (firstRow === 1) sheet.getRange(1, 1, 1, COLUMNS.length).setFontWeight("bold");
+      SpreadsheetApp.flush();
+      written += jobs.length;
+    },
+    finish(): void {
+      // Once, at the end: resizing measures every row written.
+      if (sheet) sheet.autoResizeColumns(1, COLUMNS.length);
+    },
+  };
 }
 
 export function uniqueSheetName(
@@ -1108,7 +1245,7 @@ export function uniqueSheetName(
 // Apps Script resolves handlers as globals, which a bundled module scope hides.
 const globals = globalThis as unknown as Record<string, unknown>;
 globals.onOpen = onOpen;
-globals.onHomepage = onHomepage;
+globals.onInstall = onInstall;
 globals.showSidebar = showSidebar;
 globals.getSettings = getSettings;
 globals.saveApiKey = saveApiKey;

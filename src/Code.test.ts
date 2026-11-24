@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
+import { afterEach, describe, it } from "node:test";
 
 import {
   SHEETS_SUPPORTED_FILTER_KEYS,
@@ -16,16 +17,23 @@ import {
   getConnectionStatus,
   importJobs,
   importPageSize,
-  isRetryableStatus,
+  isRetryableResponse,
   neutralizeFormula,
   oauthRedirectUri,
   occupationLevelOptions,
   saveApiKey,
   startSignIn,
+  toCoreError,
   toSearchFilters,
   uniqueSheetName,
 } from "./Code.js";
-import { JOB_SEARCH_FILTERS, type Job } from "@jobo-ai/connector-core";
+import {
+  FeedCursorRestartRequiredError,
+  InsufficientCreditsError,
+  JOB_SEARCH_FILTERS,
+  RateLimitError,
+  type Job,
+} from "@jobo-ai/connector-core";
 
 function job(overrides: Partial<Job> = {}): Job {
   return {
@@ -65,32 +73,57 @@ interface FakeResponse {
   status: number;
   body?: unknown;
   headers?: Record<string, string>;
+  /** How long the fake clock advances while this answer is on its way. */
+  takesMs?: number;
 }
+
+const realDateNow = Date.now;
+afterEach(() => {
+  Date.now = realDateNow;
+});
 
 /**
  * Just enough of the Apps Script runtime for importJobs: a saved key, a
- * scripted UrlFetchApp (an Error entry is thrown, like a network fault), and a
- * spreadsheet that records what was written.
+ * scripted UrlFetchApp (an Error entry is thrown, like a network fault), a
+ * spreadsheet that records each setValues call, and a clock that only moves
+ * when a request takes time or the code sleeps.
  */
 function installAppsScript(responses: Array<FakeResponse | Error>): {
   urls: string[];
   bodies: Array<Record<string, unknown> | null>;
-  written: unknown[][][];
+  /** Every setValues call: the row it started at and the rows it wrote. */
+  written: Array<{ row: number; rows: unknown[][] }>;
+  /** The sheet as it stands: header row first. */
+  sheet: () => unknown[][];
+  sleeps: number[];
+  /** What had happened, in order: "fetch", "write" and "flush". */
+  events: string[];
 } {
   const urls: string[] = [];
   const bodies: Array<Record<string, unknown> | null> = [];
-  const written: unknown[][][] = [];
+  const written: Array<{ row: number; rows: unknown[][] }> = [];
+  const sleeps: number[] = [];
+  const events: string[] = [];
   const g = globalThis as unknown as Record<string, unknown>;
+  let now = 1_000_000;
+  Date.now = () => now;
 
   g.PropertiesService = { getUserProperties: () => ({ getProperty: () => "jbe_test_key" }) };
-  g.Utilities = { sleep: () => undefined };
+  g.Utilities = {
+    sleep: (ms: number) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+  };
   g.UrlFetchApp = {
     fetch: (url: string, options: { method?: string; payload?: string } = {}) => {
       urls.push(url);
+      events.push("fetch");
       bodies.push(options.payload ? (JSON.parse(options.payload) as Record<string, unknown>) : null);
       const next = responses.shift();
       if (!next) throw new Error(`unexpected request ${url}`);
       if (next instanceof Error) throw next;
+      now += next.takesMs ?? 0;
       return {
         getResponseCode: () => next.status,
         getContentText: () => (next.body === undefined ? "" : JSON.stringify(next.body)),
@@ -99,11 +132,17 @@ function installAppsScript(responses: Array<FakeResponse | Error>): {
     },
   };
   g.SpreadsheetApp = {
+    flush: () => void events.push("flush"),
     getActiveSpreadsheet: () => ({
       getSheetByName: () => null,
       insertSheet: () => ({
-        getRange: () => ({
-          setValues: (rows: unknown[][]) => written.push(rows),
+        getRange: (row: number, _column: number, numRows: number, numColumns: number) => ({
+          setValues: (rows: unknown[][]) => {
+            assert.equal(rows.length, numRows, "setValues needs exactly the rows its range has");
+            for (const r of rows) assert.equal(r.length, numColumns);
+            events.push("write");
+            written.push({ row, rows });
+          },
           setFontWeight: () => undefined,
         }),
         setFrozenRows: () => undefined,
@@ -112,7 +151,13 @@ function installAppsScript(responses: Array<FakeResponse | Error>): {
     }),
   };
 
-  return { urls, bodies, written };
+  const sheet = (): unknown[][] => {
+    const grid: unknown[][] = [];
+    for (const { row, rows } of written) rows.forEach((r, i) => (grid[row - 1 + i] = r));
+    return grid;
+  };
+
+  return { urls, bodies, written, sheet, sleeps, events };
 }
 
 const billedPage = (batch: Job[], totalPages: number): FakeResponse => ({
@@ -123,15 +168,14 @@ const billedPage = (batch: Job[], totalPages: number): FakeResponse => ({
 
 describe("importJobs", () => {
   it("writes the pages already billed when a later page returns 402", () => {
-    const { urls, bodies, written } = installAppsScript([
+    const { urls, bodies, sheet } = installAppsScript([
       billedPage(jobs(100), 3),
       { status: 402, body: { detail: "Balance too low." } },
     ]);
 
     const result = importJobs({ limit: 300 });
 
-    assert.equal(written.length, 1, "page 1 should land in a sheet");
-    assert.equal(written[0].length, 101, "header row + the 100 fetched jobs");
+    assert.equal(sheet().length, 101, "header row + the 100 fetched jobs");
     assert.equal(result.ok, false);
     assert.match(result.message, /^Imported 100 of the 300 jobs requested before the import stopped\./);
     assert.match(result.message, /wallet balance is too low/i);
@@ -225,38 +269,128 @@ describe("importJobs", () => {
   });
 
   it("never writes more rows than requested when equal pages overshoot", () => {
-    const { written } = installAppsScript([billedPage(jobs(51), 2), billedPage(jobs(51, 51), 2)]);
+    const { sheet } = installAppsScript([billedPage(jobs(51), 2), billedPage(jobs(51, 51), 2)]);
 
     importJobs({ limit: 101 });
 
-    assert.equal(written[0].length, 102, "header + 101 jobs");
+    assert.equal(sheet().length, 102, "header + 101 jobs");
+    assert.equal((sheet()[101] as unknown[])[13], "job-100", "the last job written is the 101st");
   });
 
-  it("writes the pages already billed when a later page keeps failing after retries", () => {
-    const { urls, written } = installAppsScript([
-      billedPage(jobs(100), 2),
-      { status: 503 },
-      { status: 503 },
-      { status: 503 },
+  it("writes each page to the sheet before asking for the next", () => {
+    const { written, sheet, events } = installAppsScript([
+      billedPage(jobs(100), 3),
+      billedPage([job({ id: "job-100", title: "=HYPERLINK(\"https://evil.test\")" }), ...jobs(99, 101)], 3),
+      billedPage(jobs(100, 200), 3),
     ]);
+
+    const result = importJobs({ limit: 300 });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(events, ["fetch", "write", "flush", "fetch", "write", "flush", "fetch", "write", "flush"]);
+    assert.deepEqual(
+      written.map(({ row, rows }) => [row, rows.length]),
+      [
+        [1, 101],
+        [102, 100],
+        [202, 100],
+      ],
+      "one batched setValues per page, the header only with the first",
+    );
+    const rows = sheet();
+    assert.equal(rows.length, 301);
+    assert.equal(rows[0][0], "Title");
+    assert.equal(rows.filter((row) => row[0] === "Title").length, 1, "one header row");
+    assert.equal(rows[101][0], `'=HYPERLINK("https://evil.test")`, "a later page is neutralised too");
+    assert.deepEqual(
+      rows.slice(1).map((row) => row[13]),
+      Array.from({ length: 300 }, (_, n) => `job-${n}`),
+    );
+  });
+
+  it("stops starting pages near Google's time limit and says so, keeping what it wrote", () => {
+    // Each page takes 2.5 minutes: page 3 would start 5 minutes in, past the 4.5-minute budget.
+    const slow = (batch: Job[]): FakeResponse => ({ ...billedPage(batch, 10), takesMs: 150_000 });
+    const { urls, sheet } = installAppsScript([slow(jobs(100)), slow(jobs(100, 100)), slow(jobs(100, 200))]);
+
+    const result = importJobs({ limit: 1000 });
+
+    assert.equal(urls.length, 2);
+    assert.equal(sheet().length, 201);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^Imported 200 of the 1000 jobs requested\. The import stopped early/);
+    assert.match(result.message, /6-minute limit/);
+    assert.match(result.message, /Cost: \$0\.60 \(600 credits\)/);
+  });
+
+  it("does not wait out a Retry-After that ends past the time budget", () => {
+    const { urls, sleeps, sheet } = installAppsScript([
+      { ...billedPage(jobs(100), 3), takesMs: 260_000 },
+      { status: 429, headers: { "Retry-After": "30" } },
+    ]);
+
+    const result = importJobs({ limit: 300 });
+
+    assert.equal(urls.length, 2);
+    assert.deepEqual(sleeps, [], "the 30-second wait would end after the budget");
+    assert.equal(sheet().length, 101);
+    assert.match(result.message, /^Imported 100 of the 300 jobs requested before the import stopped\. Jobo rate limit/);
+  });
+
+  it("never replays a search after a 503 without Retry-After, a 500 or a dropped connection", () => {
+    for (const failed of [
+      { status: 503, body: { title: "Search took too long" } } as FakeResponse,
+      { status: 503 } as FakeResponse,
+      { status: 500, body: { title: "Internal error" } } as FakeResponse,
+      { status: 502 } as FakeResponse,
+      new Error("Address unavailable"),
+    ]) {
+      const { urls, sheet } = installAppsScript([billedPage(jobs(100), 2), failed]);
+
+      const result = importJobs({ limit: 200 });
+
+      assert.equal(urls.length, 2, `${JSON.stringify(failed)} is not retried: the page may already be billed`);
+      assert.equal(sheet().length, 101);
+      assert.equal(result.ok, false);
+      assert.match(result.message, /^Imported 100 of the 200 jobs requested before the import stopped/);
+    }
+  });
+
+  it("retries a search on a 429 and on a 503 that carries Retry-After, waiting as told", () => {
+    const { urls, sleeps, sheet } = installAppsScript([
+      { status: 503, headers: { "Retry-After": "5" }, body: { title: "Service unavailable" } },
+      { status: 429, headers: { "Retry-After": "2" } },
+      billedPage(jobs(10), 1),
+    ]);
+
+    const result = importJobs({ limit: 10 });
+
+    assert.equal(urls.length, 3);
+    assert.deepEqual(sleeps, [5000, 2000]);
+    assert.equal(sheet().length, 11);
+    assert.equal(result.ok, true);
+  });
+
+  it("gives up after three attempts", () => {
+    const busy: FakeResponse = { status: 503, headers: { "Retry-After": "5" } };
+    const { urls, sheet } = installAppsScript([billedPage(jobs(100), 2), busy, busy, busy]);
 
     const result = importJobs({ limit: 200 });
 
     assert.equal(urls.length, 4, "page 2 is tried three times");
-    assert.equal(written[0].length, 101);
-    assert.equal(result.ok, false);
+    assert.equal(sheet().length, 101);
     assert.match(result.message, /^Imported 100 of the 200 jobs requested/);
     assert.match(result.message, /HTTP 503/);
   });
 
   it("writes the pages already billed when a later fetch throws", () => {
-    const { written } = installAppsScript([billedPage(jobs(100), 2), new Error("Address unavailable")]);
+    const { sheet } = installAppsScript([billedPage(jobs(100), 2), new Error("Address unavailable")]);
 
     const result = importJobs({ limit: 200 });
 
-    assert.equal(written[0].length, 101);
+    assert.equal(sheet().length, 101);
     assert.equal(result.ok, false);
-    assert.match(result.message, /Address unavailable/);
+    assert.match(result.message, /Jobo could not be reached: Address unavailable/);
   });
 
   it("writes nothing when the first page fails", () => {
@@ -270,13 +404,34 @@ describe("importJobs", () => {
   });
 
   it("reports a complete import as before", () => {
-    const { written } = installAppsScript([billedPage(jobs(100), 2), billedPage(jobs(50, 100), 2)]);
+    const { sheet } = installAppsScript([billedPage(jobs(100), 2), billedPage(jobs(50, 100), 2)]);
 
     const result = importJobs({ limit: 150 });
 
-    assert.equal(written[0].length, 151);
+    assert.equal(sheet().length, 151);
     assert.equal(result.ok, true);
     assert.match(result.message, /^Imported 150 jobs\. Cost: \$0\.45 \(450 credits\)\./);
+  });
+});
+
+describe("free requests", () => {
+  it("retry a dropped connection and a 500, which cost nothing to replay", () => {
+    installAppsScript([
+      new Error("Address unavailable"),
+      { status: 500 },
+      { status: 200, body: { suggestions: [{ display_name: "Berlin, Germany", city: "Berlin", region: null, country: "Germany" }] } },
+    ]);
+
+    const suggest = (globalThis as unknown as Record<string, (q: string) => { suggestions: unknown[] }>).suggestLocations;
+    assert.equal(suggest("berl").suggestions.length, 1);
+  });
+
+  it("do not retry a 503 the API sent without Retry-After", () => {
+    const { urls } = installAppsScript([{ status: 503, body: { title: "Search took too long" } }]);
+
+    const suggest = (globalThis as unknown as Record<string, (q: string) => { suggestions: unknown[] }>).suggestLocations;
+    assert.deepEqual(suggest("berl").suggestions, []);
+    assert.equal(urls.length, 1);
   });
 });
 
@@ -880,30 +1035,83 @@ describe("sign in with Jobo", () => {
   });
 });
 
-describe("retry policy", () => {
+describe("retry policy (connector-core's)", () => {
+  const failed = (status: number, body: unknown = null, retryAfterSeconds: number | null = null) => ({
+    status,
+    body,
+    retryAfterSeconds,
+  });
+
   it("never retries insufficient credits — the precheck would fail identically", () => {
-    assert.equal(isRetryableStatus(402, null), false);
+    assert.equal(isRetryableResponse(failed(402), true), false);
   });
 
   it("never retries a void feed cursor", () => {
-    assert.equal(isRetryableStatus(409, "feed_cursor_restart_required"), false);
+    assert.equal(isRetryableResponse(failed(409, { code: "feed_cursor_restart_required" }), true), false);
   });
 
-  it("never retries an auth failure", () => {
-    assert.equal(isRetryableStatus(401, null), false);
-    assert.equal(isRetryableStatus(403, null), false);
+  it("never retries an auth failure or a bad request", () => {
+    for (const status of [400, 401, 403, 404]) assert.equal(isRetryableResponse(failed(status), true), false);
   });
 
-  it("retries throttling and server faults", () => {
-    assert.equal(isRetryableStatus(429, null), true);
-    assert.equal(isRetryableStatus(500, null), true);
-    assert.equal(isRetryableStatus(503, null), true);
-    assert.equal(isRetryableStatus(0, null), true);
+  it("retries throttling and an outage that names a wait, billed or not", () => {
+    for (const replaySafe of [true, false]) {
+      assert.equal(isRetryableResponse(failed(429), replaySafe), true);
+      assert.equal(isRetryableResponse(failed(503, { title: "Unavailable" }, 5), replaySafe), true);
+    }
   });
 
-  it("does not retry a bad request", () => {
-    assert.equal(isRetryableStatus(400, null), false);
-    assert.equal(isRetryableStatus(404, null), false);
+  it("never retries the API's 503 without Retry-After: the search ran out of time", () => {
+    for (const replaySafe of [true, false]) {
+      assert.equal(isRetryableResponse(failed(503, { title: "Search took too long" }), replaySafe), false);
+    }
+  });
+
+  it("retries a server fault only for a request that is free to replay", () => {
+    assert.equal(isRetryableResponse(failed(500), true), true);
+    assert.equal(isRetryableResponse(failed(502), true), true);
+    assert.equal(isRetryableResponse(failed(500), false), false);
+    assert.equal(isRetryableResponse(failed(502), false), false);
+  });
+
+  it("classifies a failed response as the core client would", () => {
+    assert.ok(toCoreError(failed(402)) instanceof InsufficientCreditsError);
+    assert.ok(toCoreError(failed(429)) instanceof RateLimitError);
+    assert.ok(toCoreError(failed(409, { code: "feed_cursor_restart_required" })) instanceof FeedCursorRestartRequiredError);
+    assert.equal(toCoreError(failed(503, null, 5)).retryAfterSeconds, 5);
+  });
+});
+
+describe("built sidebar", () => {
+  it("inlines the shared UI assets verbatim", () => {
+    const dist = new URL("../dist/", import.meta.url);
+    const ui = new URL("../../packages/connector-ui/", import.meta.url);
+    const sidebar = readFileSync(new URL("Sidebar.html", dist), "utf8");
+
+    assert.ok(sidebar.includes(readFileSync(new URL("combobox.css", ui), "utf8")));
+    assert.ok(sidebar.includes(readFileSync(new URL("combobox.js", ui), "utf8").replace(/^export /gm, "")));
+    assert.ok(!sidebar.includes("@inline:"), "every marker was replaced");
+  });
+});
+
+describe("manifest", () => {
+  it("describes the editor add-on the code implements", () => {
+    const manifest = JSON.parse(readFileSync(new URL("../dist/appsscript.json", import.meta.url), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const globals = globalThis as unknown as Record<string, unknown>;
+
+    // addOns (and its homepage trigger, which must return Cards) is for Google Workspace add-ons only.
+    assert.equal(manifest.addOns, undefined);
+    assert.equal(globals.onHomepage, undefined);
+    assert.equal(typeof globals.onOpen, "function");
+    assert.equal(typeof globals.onInstall, "function");
+    assert.deepEqual(manifest.oauthScopes, [
+      "https://www.googleapis.com/auth/spreadsheets.currentonly",
+      "https://www.googleapis.com/auth/script.container.ui",
+      "https://www.googleapis.com/auth/script.external_request",
+    ]);
   });
 });
 

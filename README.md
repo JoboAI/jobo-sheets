@@ -35,14 +35,34 @@ The other connectors share `@jobo-ai/connector-core`'s `JoboClient`. This one de
 the `google.script.run` boundary, and nothing guarantees the microtask queue drains before a synchronous
 handler returns. Spin-waiting on a promise would work in testing and fail unpredictably in production.
 
-So `Code.ts` makes blocking `UrlFetchApp` calls and reproduces the part of connector-core's behaviour that
-actually matters — **which statuses are terminal** — explicitly, with tests. It still shares the canonical
-filter values, the `Job` type, API key validation and `toJobSearchBody()` (the sidebar request becomes a
-`POST /api/jobs/search` body through it), so those cannot drift.
+So `Code.ts` makes blocking `UrlFetchApp` calls. The retry decision still comes from connector-core:
+`request()` turns each failed response into the error the core client would throw (`toCoreError()`) and
+asks the core's `isRetryable()` and `nextDelayMs()` whether to try again and how long to wait. That gives
+the add-on the core's rules:
+
+- The search (`POST /api/jobs/search`) bills every job it returns, so it is replayed only on a 429 or a 503
+  that carries `Retry-After`. After a dropped connection, a 500 or any other 5xx the charge may already
+  have been made, so the import stops there instead.
+- A 503 without `Retry-After` ("Search took too long") is never retried, on any request: the same search
+  runs out of time again.
+- The free requests (filter options, typeahead, occupations) are also retried after a dropped connection
+  or a 5xx.
+- `Retry-After` is honoured on any status, capped at 30 seconds.
+
+It also shares the canonical filter values, the `Job` type, API key validation and `toJobSearchBody()`
+(the sidebar request becomes a `POST /api/jobs/search` body through it), so those cannot drift.
+
+## Imports and Apps Script's 6-minute limit
+
+An Apps Script run is killed after 6 minutes. `importJobs()` writes each page to the sheet as it arrives
+(one `setValues` per page, header row with the first, then `SpreadsheetApp.flush()`), so a page that was
+billed is in the sheet before the next one is requested. It stops starting new pages, and skips any retry
+whose wait would end, after `IMPORT_TIME_BUDGET_MS` (4.5 minutes), and the message says how many jobs were
+written and that the import stopped early.
 
 ## Filters
 
-The sidebar covers connector-core's `JOB_SEARCH_FILTERS` (pinned `0.4.0`) except `posted_before`,
+The sidebar covers connector-core's `JOB_SEARCH_FILTERS` (pinned `0.6.0`) except `posted_before`,
 `discovered_after`, `discovered_before` (a one-shot import has no use for those windows) and
 `description_format` (no description column). `SHEETS_SUPPORTED_FILTER_KEYS` plus the drift-guard test in
 `Code.test.ts` keep that list honest.
@@ -128,9 +148,11 @@ npx --yes @google/clasp login && npm run push
 The live API round trip, and anything requiring the Apps Script runtime itself — the real `UrlFetchApp`,
 `PropertiesService`, sheet writes, and the sidebar. The tests cover retry classification, failure
 messaging, query building, location formatting, sheet naming and the picker option mapping, plus the import
-loop against a scripted fake of those services (the exact search body every filter produces, equal page
-sizes, API warnings in the message, and a failed later page still writing the pages already billed).
-Everything else needs a real deployment and a `jbe_test_` key.
+loop against a scripted fake of those services and a fake clock (the exact search body every filter
+produces, equal page sizes, API warnings in the message, each page written before the next is requested,
+the time budget, which failures are retried, and a failed later page keeping the pages already billed).
+They also check the built `dist/` (the manifest, and the shared UI inlined verbatim). Everything else
+needs a real deployment and a `jbe_test_` key.
 
 Sign in with Jobo is covered against scripted fakes only: the authorization URL, the challenge for a known
 verifier, self-registration, and every outcome of the callback. It has never run in Apps Script. To check
@@ -142,10 +164,20 @@ user; and the full round trip, first as a self-registered copy and then with the
 
 ## Publishing
 
+This is an **editor add-on**, not a Google Workspace add-on. It adds a menu under **Extensions**
+(`onOpen`, and `onInstall` for the file open at install time) and shows an HTML sidebar. So
+`appsscript.json` has no `addOns` section: that section, with its homepage trigger that must return Cards,
+is only for Workspace add-ons, which are built with the Card service and cannot open an HTML sidebar. The
+manifest holds just the runtime and the three scopes above. The add-on's name and logo are set in the
+Marketplace SDK's store listing, not in the manifest.
+
 Unlike the other connectors, Sheets has no CI publish step — `clasp login` and the Workspace Marketplace
 console are both interactive, and `.clasp.json` is gitignored on purpose (it's a per-developer script
 binding, not something to share). See [`../RELEASING.md`](../RELEASING.md) for the full sequence: `clasp
 push`, the OAuth consent screen, the scope-classification check above, and the Marketplace listing review.
+For an editor add-on, Google's publishing steps also need a numbered version of the script project
+(create one after `clasp push`), whose number goes into the Marketplace SDK's app configuration as an
+editor add-on for Sheets, and a standard Google Cloud project rather than the script's default one.
 
 > ⚠️ Re-read the scope warning above before every OAuth verification submission — it is the single most
 > expensive way this add-on can go wrong.

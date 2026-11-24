@@ -64,7 +64,13 @@ renameSync(join(dist, "Code.js"), join(dist, "Code.gs"));
       if (!html.includes(marker)) {
         throw new Error(`${page} is missing the inline marker "${marker}" for ${file}`);
       }
-      html = html.replace(marker, transform(readFileSync(join(connectorUi, file), "utf8")));
+      const asset = transform(readFileSync(join(connectorUi, file), "utf8"));
+      // A function replacement is inserted as is. A string replacement would
+      // read `$&`, `$'` and `` $` `` in the inlined code as replacement patterns.
+      html = html.replace(marker, () => asset);
+      if (!html.includes(asset)) {
+        throw new Error(`${page}: ${file} was not inlined verbatim`);
+      }
     }
     writeFileSync(join(dist, page), html);
   }
