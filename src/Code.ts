@@ -1,5 +1,6 @@
 /**
- * Jobo for Sheets — pulls filtered job data into the active spreadsheet.
+ * Jobo for Sheets — pulls filtered job data, and the hiring signals of the
+ * companies a user cares about, into the active spreadsheet.
  *
  * Apps Script constraints that shape this file:
  *
@@ -19,6 +20,7 @@
 
 import {
   COMPANY_CATEGORIES,
+  COMPANY_SIZES,
   EMPLOYMENT_TYPES,
   EXPERIENCE_LEVELS,
   FeedCursorRestartRequiredError,
@@ -26,14 +28,27 @@ import {
   JoboApiError,
   JoboTransportError,
   LANGUAGES,
+  NARROWING_SIGNAL_FILTER_KEYS,
   RateLimitError,
+  SIGNAL_DEFAULT_LIMIT,
+  SIGNAL_MAX_LIMIT,
+  SIGNAL_MAX_LIST_VALUES,
+  SIGNAL_POLL_SORT,
+  SIGNAL_TYPES,
   WORK_MODELS,
   defaultRetryOptions,
+  describeSignal,
   isRetryable,
   isValidApiKeyFormat,
   nextDelayMs,
+  signalStrengthBand,
+  signalTypeLabel,
   toJobSearchBody,
+  toSignalsQuery,
   type CompanySuggestion,
+  type HiringSignal,
+  type HiringSignalFilters,
+  type HiringSignalListResponse,
   type Job,
   type JobFacet,
   type JobSearchFilters,
@@ -56,8 +71,19 @@ const ACCOUNT_EMAIL_PROPERTY = "JOBO_ACCOUNT_EMAIL";
 const BASE_URL = "https://connect.jobo.world";
 const MAX_ATTEMPTS = 3;
 
+/**
+ * One column of an import. `text` makes the column plain text before anything
+ * is written to it, so Sheets keeps the value as sent instead of reading it as
+ * a date or a number.
+ */
+interface Column<T> {
+  header: string;
+  value: (item: T) => string | number;
+  text?: boolean;
+}
+
 /** Columns written to the sheet, in order. */
-const COLUMNS: Array<{ header: string; value: (job: Job) => string | number }> = [
+const COLUMNS: Array<Column<Job>> = [
   { header: "Title", value: (j) => j.title },
   { header: "Company", value: (j) => j.company?.name ?? "" },
   { header: "Location", value: (j) => formatLocation(j) },
@@ -159,8 +185,8 @@ const RETRY_TIMING = {
 
 export interface RequestOptions {
   /**
-   * False for a request billed for what it returns. Default true: every other
-   * endpoint this add-on calls is free.
+   * False for a request billed for what it returns: the job search and the
+   * signals read. Default true: every other endpoint this add-on calls is free.
    */
   replaySafe?: boolean;
   /** Epoch ms. No retry is started whose wait would end after it. */
@@ -277,7 +303,7 @@ function apiKey(): string {
 }
 
 /** Build a query string, dropping empty values. */
-export function buildQuery(params: Record<string, string | number | undefined>): string {
+export function buildQuery(params: Record<string, string | number | boolean | undefined>): string {
   const parts: string[] = [];
   for (const key of Object.keys(params)) {
     const value = params[key];
@@ -296,8 +322,12 @@ export function buildQuery(params: Record<string, string | number | undefined>):
 // onOpen and onInstall can run before the user has authorised the add-on in
 // this file (AuthMode.NONE), so they only build the menu.
 
-function onOpen(): void {
-  SpreadsheetApp.getUi().createAddonMenu().addItem("Import jobs…", "showSidebar").addToUi();
+export function onOpen(): void {
+  SpreadsheetApp.getUi()
+    .createAddonMenu()
+    .addItem("Import jobs…", "showSidebar")
+    .addItem("Import hiring signals…", "showSignalsSidebar")
+    .addToUi();
 }
 
 /** Installing from the Marketplace does not run onOpen for the file already open. */
@@ -305,14 +335,32 @@ function onInstall(): void {
   onOpen();
 }
 
-function showSidebar(): void {
-  const html = HtmlService.createHtmlOutputFromFile("Sidebar").setTitle("Career Site Jobs");
+/**
+ * Both menu items open the one sidebar, on a different view. The views share
+ * the connection (sign-in, key, Disconnect), so it lives in one place.
+ *
+ * Sidebar.html is a template for this alone: the view is printed into
+ * `data-view` on its body, where a printing scriptlet escapes it. A sidebar
+ * cannot be told which menu item opened it any other way.
+ */
+function openSidebar(view: "jobs" | "signals"): void {
+  const template = HtmlService.createTemplateFromFile("Sidebar");
+  template.view = view;
+  const html = template.evaluate().setTitle(view === "signals" ? "Hiring Signals" : "Career Site Jobs");
   SpreadsheetApp.getUi().showSidebar(html);
+}
+
+export function showSidebar(): void {
+  openSidebar("jobs");
+}
+
+export function showSignalsSidebar(): void {
+  openSidebar("signals");
 }
 
 // ── Called from the sidebar ──────────────────────────────────────────────────
 
-function getSettings(): {
+export function getSettings(): {
   hasKey: boolean;
   /** The signed-in account, when the key came from Sign in with Jobo. */
   accountEmail: string | null;
@@ -321,6 +369,8 @@ function getSettings(): {
   experienceLevels: string[];
   companyCategories: string[];
   languages: Array<{ code: string; name: string }>;
+  signalTypeGroups: SignalTypeGroup[];
+  companySizes: string[];
 } {
   const connection = getConnectionStatus();
   return {
@@ -331,6 +381,8 @@ function getSettings(): {
     experienceLevels: EXPERIENCE_LEVELS.slice(),
     companyCategories: COMPANY_CATEGORIES.slice(),
     languages: LANGUAGES.map((language) => ({ code: language.code, name: language.name })),
+    signalTypeGroups: signalTypeGroups(),
+    companySizes: COMPANY_SIZES.slice(),
   };
 }
 
@@ -1089,12 +1141,9 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
     const limit = Math.min(Math.max(req.limit ?? 100, 1), 1000);
     const deadline = Date.now() + IMPORT_TIME_BUDGET_MS;
 
-    const sheet = importSheet();
+    const sheet = sheetWriter(COLUMNS, "Jobo Jobs");
     let page = 1;
-    let creditsSpent = 0;
-    let balance: number | null = null;
-    let quotaLimit: number | null = null;
-    let quotaRemaining: number | null = null;
+    const usage = newUsage();
     let failure: string | null = null;
     let outOfTime = false;
     const notes: string[] = [];
@@ -1135,10 +1184,7 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
         break;
       }
 
-      creditsSpent += result.creditsDeducted ?? 0;
-      balance = result.creditsBalance ?? balance;
-      quotaLimit = result.quotaLimit ?? quotaLimit;
-      quotaRemaining = result.quotaRemaining ?? quotaRemaining;
+      addUsage(usage, result);
 
       if (page === 1) notes.push(...warningText(result.body));
 
@@ -1166,15 +1212,14 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
 
     sheet.finish();
 
-    const cost = creditsSpent > 0 ? ` Cost: $${(creditsSpent / 1000).toFixed(2)} (${creditsSpent} credits).` : "";
-    const left = balance != null ? ` Wallet balance: $${(balance / 1000).toFixed(2)}.` : "";
-    const included = quotaRemaining != null
-      ? ` Included jobs: ${quotaRemaining}${quotaLimit != null ? ` of ${quotaLimit}` : ""} remaining.`
+    const wallet = walletText(usage);
+    const included = usage.quotaRemaining != null
+      ? ` Included jobs: ${usage.quotaRemaining}${usage.quotaLimit != null ? ` of ${usage.quotaLimit}` : ""} remaining.`
       : "";
     if (failure != null) {
       return {
         ok: false,
-        message: `Imported ${written} of the ${limit} jobs requested before the import stopped. ${failure}${cost}${left}${included}${note}`,
+        message: `Imported ${written} of the ${limit} jobs requested before the import stopped. ${failure}${wallet}${included}${note}`,
       };
     }
     if (outOfTime) {
@@ -1183,51 +1228,658 @@ export function importJobs(req: ImportRequest): { ok: boolean; message: string }
         message:
           `Imported ${written} of the ${limit} jobs requested. The import stopped early to finish inside ` +
           `Google's 6-minute limit for one run. Importing again starts from the first matching job and bills ` +
-          `again for the jobs already imported.${cost}${left}${included}${note}`,
+          `again for the jobs already imported.${wallet}${included}${note}`,
       };
     }
-    return { ok: true, message: `Imported ${written} jobs.${cost}${left}${included}${note}` };
+    return { ok: true, message: `Imported ${written} jobs.${wallet}${included}${note}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };
   }
 }
 
+type Sheet = GoogleAppsScript.Spreadsheet.Sheet;
+
 /**
- * The sheet one import writes to, created with its header row when the first
- * job arrives. Each append is one setValues call followed by a flush, so a page
- * is in the spreadsheet before the next one is requested: a run that is killed
- * or fails later keeps every page it was billed for.
+ * The sheet one import writes to. Without `existing`, a new tab named after
+ * `baseName` is created with its header row when the first item arrives; with
+ * it, rows are appended below what the tab already holds. Each append is one
+ * setValues call followed by a flush, so a page is in the spreadsheet before
+ * the next one is requested: a run that is killed or fails later keeps every
+ * page it was billed for.
  */
-function importSheet(): { append: (jobs: Job[]) => void; finish: () => void; written: () => number } {
-  let sheet: GoogleAppsScript.Spreadsheet.Sheet | null = null;
+function sheetWriter<T>(
+  columns: Array<Column<T>>,
+  baseName: string,
+  existing: Sheet | null = null,
+): { append: (items: T[]) => void; finish: () => void; written: () => number; name: () => string } {
+  let sheet: Sheet | null = existing;
+  const startRow = existing ? existing.getLastRow() + 1 : 1;
+  let rowsWritten = 0;
   let written = 0;
 
   return {
     written: () => written,
-    append(jobs: Job[]): void {
-      if (jobs.length === 0) return;
+    name: () => (sheet ? sheet.getName() : ""),
+    append(items: T[]): void {
+      if (items.length === 0) return;
       const rows: Array<Array<string | number>> = [];
       // Header and first page in one write; formatted now, not at the end, so
       // a sheet left by a killed run still reads as a table.
-      if (!sheet) rows.push(COLUMNS.map((c) => c.header));
-      for (const job of jobs) rows.push(COLUMNS.map((c) => neutralizeFormula(c.value(job))));
+      if (!sheet) rows.push(columns.map((c) => c.header));
+      for (const item of items) rows.push(columns.map((c) => neutralizeFormula(c.value(item))));
 
-      const firstRow = sheet ? written + 2 : 1;
       if (!sheet) {
         const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-        sheet = spreadsheet.insertSheet(uniqueSheetName(spreadsheet, "Jobo Jobs"));
+        sheet = spreadsheet.insertSheet(uniqueSheetName(spreadsheet, baseName));
         sheet.setFrozenRows(1);
       }
-      sheet.getRange(firstRow, 1, rows.length, COLUMNS.length).setValues(rows);
-      if (firstRow === 1) sheet.getRange(1, 1, 1, COLUMNS.length).setFontWeight("bold");
+      const firstRow = startRow + rowsWritten;
+      // Before the values: a value is read as a date or a number as it lands.
+      columns.forEach((column, index) => {
+        if (column.text) (sheet as Sheet).getRange(firstRow, index + 1, rows.length, 1).setNumberFormat("@");
+      });
+      sheet.getRange(firstRow, 1, rows.length, columns.length).setValues(rows);
+      if (firstRow === 1) sheet.getRange(1, 1, 1, columns.length).setFontWeight("bold");
       SpreadsheetApp.flush();
-      written += jobs.length;
+      rowsWritten += rows.length;
+      written += items.length;
     },
     finish(): void {
       // Once, at the end: resizing measures every row written.
-      if (sheet) sheet.autoResizeColumns(1, COLUMNS.length);
+      if (sheet) sheet.autoResizeColumns(1, columns.length);
     },
   };
+}
+
+/** What the billing headers said over one import: the charges summed, the latest balance and allowance. */
+interface Usage {
+  creditsSpent: number;
+  balance: number | null;
+  quotaLimit: number | null;
+  quotaRemaining: number | null;
+  /** True once any response carried a billing header. The Unlimited plan sends none. */
+  reported: boolean;
+}
+
+function newUsage(): Usage {
+  return { creditsSpent: 0, balance: null, quotaLimit: null, quotaRemaining: null, reported: false };
+}
+
+function addUsage(usage: Usage, result: ApiResult): void {
+  usage.creditsSpent += result.creditsDeducted ?? 0;
+  usage.balance = result.creditsBalance ?? usage.balance;
+  usage.quotaLimit = result.quotaLimit ?? usage.quotaLimit;
+  usage.quotaRemaining = result.quotaRemaining ?? usage.quotaRemaining;
+  if ([result.creditsDeducted, result.creditsBalance, result.quotaLimit, result.quotaRemaining].some((v) => v != null)) {
+    usage.reported = true;
+  }
+}
+
+/** " Cost: $0.30 (300 credits). Wallet balance: $4.20." — each part only when the headers said it. */
+function walletText(usage: Usage): string {
+  const cost =
+    usage.creditsSpent > 0 ? ` Cost: $${(usage.creditsSpent / 1000).toFixed(2)} (${usage.creditsSpent} credits).` : "";
+  const left = usage.balance != null ? ` Wallet balance: $${(usage.balance / 1000).toFixed(2)}.` : "";
+  return cost + left;
+}
+
+// ── Hiring Signals ───────────────────────────────────────────────────────────
+//
+// GET /api/signals, read into a tab of its own. It is built from the job
+// import's pieces: request() with its retry policy, marked as billed so a lost
+// answer is never replayed; the same sheet writer, formula neutralising and
+// time budget. What differs: paging is by cursor; a watchlist of more than
+// 100 domains is read in requests of at most 100 that share one budget; and
+// "only new" appends to a signals tab, reading from its newest signal on.
+//
+// connector-core's JoboClient and pollSignals are async and cannot run here
+// (see the top of this file); its pure helpers are used as they are:
+// toSignalsQuery for the query, describeSignal and the labels for the rows.
+
+/** The most signals one import reads. Each one is billed, at ten times a job. */
+export const SIGNALS_IMPORT_MAX = 1000;
+
+/**
+ * The signal types as the dashboard groups them. A type missing here (one the
+ * core learns later) is still offered, under "Other": see signalTypeGroups().
+ */
+export const SIGNAL_TYPE_GROUPS: ReadonlyArray<{ label: string; types: readonly string[] }> = [
+  { label: "Growth", types: ["hiring_surge", "function_surge", "hiring_resumed"] },
+  { label: "Expansion", types: ["new_country", "new_city", "new_function", "first_role"] },
+  { label: "Leadership", types: ["leadership_hire", "leadership_role_closed"] },
+  { label: "Tech and skills", types: ["new_technology", "new_skill"] },
+  { label: "Slowing or struggling", types: ["hiring_slowdown", "hiring_freeze", "hard_to_fill"] },
+];
+
+export interface SignalTypeGroup {
+  label: string;
+  types: Array<{ value: string; label: string }>;
+}
+
+/** The sidebar's signal type checkboxes, with the core's labels. */
+export function signalTypeGroups(): SignalTypeGroup[] {
+  const option = (type: string) => ({ value: type, label: signalTypeLabel(type) });
+  const groups: SignalTypeGroup[] = SIGNAL_TYPE_GROUPS.map((group) => ({
+    label: group.label,
+    types: group.types.map(option),
+  }));
+  const grouped = new Set(SIGNAL_TYPE_GROUPS.flatMap((group) => group.types));
+  const others = SIGNAL_TYPES.filter((type) => !grouped.has(type));
+  if (others.length > 0) groups.push({ label: "Other", types: others.map(option) });
+  return groups;
+}
+
+/** A list cell: the values joined with ", ", ignoring anything that is not text. */
+function listCell(values: unknown): string {
+  return Array.isArray(values) ? values.filter((v) => typeof v === "string" && v !== "").join(", ") : "";
+}
+
+/**
+ * Columns of a signals tab, in order. "Only new" finds its way back by these
+ * headers, so renaming one makes earlier tabs unrecognised.
+ *
+ * Every field is read defensively: a type added after this was written may
+ * carry less, and describeSignal() falls back to the type's label.
+ */
+export const SIGNAL_COLUMNS: Array<Column<HiringSignal>> = [
+  { header: "Detected", value: (s) => s.detected_on ?? "" },
+  { header: "Company", value: (s) => s.company?.name ?? "" },
+  { header: "Domain", value: (s) => s.company?.domain ?? "" },
+  { header: "Signal", value: (s) => signalTypeLabel(s.type) },
+  { header: "Summary", value: (s) => describeSignal(s) },
+  { header: "Strength", value: (s) => (typeof s.strength === "number" ? s.strength : "") },
+  { header: "Strength band", value: (s) => (typeof s.strength === "number" ? signalStrengthBand(s.strength) : "") },
+  { header: "Country", value: (s) => s.company?.country_code ?? "" },
+  // Text: Sheets reads a band like "1-10" as a date.
+  { header: "Company size", value: (s) => s.company?.size ?? "", text: true },
+  { header: "Industry", value: (s) => s.company?.industry ?? "" },
+  { header: "Funding stage", value: (s) => s.company?.funding_stage ?? "" },
+  { header: "Functions", value: (s) => listCell(s.focus?.functions) },
+  { header: "Role", value: (s) => s.focus?.title || s.focus?.occupation || "" },
+  { header: "Seniority", value: (s) => s.focus?.seniority ?? "" },
+  { header: "Topics", value: (s) => listCell(s.focus?.topics) },
+  { header: "Job countries", value: (s) => listCell(s.focus?.job_countries) },
+  { header: "Evidence job IDs", value: (s) => listCell(s.evidence_job_ids) },
+  // Text, so the seven decimal places "only new" sends back are kept as they came.
+  { header: "Created at", value: (s) => s.created_at ?? "", text: true },
+  { header: "Signal ID", value: (s) => s.id ?? "", text: true },
+];
+
+const CREATED_AT_COLUMN = SIGNAL_COLUMNS.findIndex((c) => c.header === "Created at") + 1;
+const SIGNAL_ID_COLUMN = SIGNAL_COLUMNS.findIndex((c) => c.header === "Signal ID") + 1;
+
+/**
+ * One domain as the API stores it: the host, lower-cased, without a scheme,
+ * `www.`, path, user or port. Mirrors HiringSignalDomains.Normalize on the
+ * server, which refuses the whole request for a value it cannot read; null
+ * here is a value that is not a domain.
+ */
+export function normalizeDomain(value: string): string | null {
+  let host = String(value ?? "").trim().toLowerCase();
+  const scheme = host.indexOf("://");
+  if (scheme >= 0) host = host.slice(scheme + 3);
+  const end = host.search(/[/?#]/);
+  if (end >= 0) host = host.slice(0, end);
+  host = host.slice(host.lastIndexOf("@") + 1);
+  const port = host.indexOf(":");
+  if (port >= 0) host = host.slice(0, port);
+  if (host.startsWith("www.")) host = host.slice(4);
+  host = host.replace(/^\.+|\.+$/g, "");
+  return host.length === 0 || !host.includes(".") || /\s/.test(host) ? null : host;
+}
+
+/**
+ * Website domains from the sidebar's box or from cells: split on line breaks,
+ * commas, semicolons and spaces, normalised, de-duplicated in the order given.
+ * `rejected` holds what is not a domain, such as a header cell.
+ */
+export function cleanDomains(input: string | ReadonlyArray<unknown> | null | undefined): {
+  domains: string[];
+  rejected: string[];
+} {
+  const values: ReadonlyArray<unknown> = typeof input === "string" ? [input] : input ?? [];
+  const domains: string[] = [];
+  const rejected: string[] = [];
+  for (const value of values) {
+    if (value == null) continue;
+    for (const part of String(value).split(/[\s,;]+/)) {
+      if (part === "") continue;
+      const domain = normalizeDomain(part);
+      if (domain == null) {
+        if (!rejected.includes(part)) rejected.push(part);
+      } else if (!domains.includes(domain)) {
+        domains.push(domain);
+      }
+    }
+  }
+  return { domains, rejected };
+}
+
+/** The sidebar's "Use the selected cells": the domains in the selection, and how many cells held none. */
+export function getSelectedDomains(): { domains: string[]; skipped: number } {
+  const range = SpreadsheetApp.getActiveRange();
+  if (!range) return { domains: [], skipped: 0 };
+  // Display values: a cell showing a link gives the text it shows.
+  const { domains, rejected } = cleanDomains(range.getDisplayValues().flat());
+  return { domains, skipped: rejected.length };
+}
+
+/** An instant as `created_at` writes it, split so that all seven decimal places compare. */
+interface Instant {
+  /** Whole seconds since the epoch. */
+  seconds: number;
+  /** The decimal places, padded to seven. */
+  fraction: string;
+}
+
+/**
+ * Reads `2026-11-20T09:15:30.1234567Z` (a fraction of up to seven places, and
+ * Z, an offset or neither, which the API reads as UTC). A JavaScript Date
+ * keeps milliseconds only, so the fraction is kept as text.
+ */
+export function parseInstant(text: unknown): Instant | null {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,7}))?(Z|[+-]\d{2}:\d{2})?$/.exec(String(text ?? "").trim());
+  if (!match) return null;
+  const ms = Date.parse(`${match[1]}${match[3] ?? "Z"}`);
+  if (!isFinite(ms)) return null;
+  return { seconds: Math.floor(ms / 1000), fraction: (match[2] ?? "").padEnd(7, "0") };
+}
+
+function compareInstants(a: Instant, b: Instant): number {
+  if (a.seconds !== b.seconds) return a.seconds - b.seconds;
+  return a.fraction < b.fraction ? -1 : a.fraction > b.fraction ? 1 : 0;
+}
+
+/** The newest of these `created_at` values, as written; null when none can be read. */
+export function newestCreatedAt(values: ReadonlyArray<unknown>): string | null {
+  let newest: { text: string; instant: Instant } | null = null;
+  for (const value of values) {
+    const instant = parseInstant(value);
+    if (instant && (!newest || compareInstants(instant, newest.instant) > 0)) {
+      newest = { text: String(value).trim(), instant };
+    }
+  }
+  return newest ? newest.text : null;
+}
+
+/**
+ * Where an "only new" import starts reading: the newest Created at in the
+ * tab, exactly as it is written there.
+ *
+ * "Only new" reads in the order signals were stored (`sort=created_asc`).
+ * There `created_after` is exclusive and compares every decimal place, and a
+ * signal that becomes readable later never has an earlier `created_at`. So
+ * the newest value, sent back as the string the tab holds, reads nothing the
+ * tab already has and misses nothing stored since: no overlap, and nothing
+ * billed twice. The value is never parsed into a date on the way: a date
+ * keeps milliseconds, and the signals of one batch are a microsecond apart.
+ *
+ * Null: the tab holds no signal to read after.
+ */
+export function signalsReadBound(newest: string | null): string | null {
+  if (newest == null || parseInstant(newest) == null) return null;
+  return newest.trim();
+}
+
+/** A tab this add-on wrote signals to, with what "only new" needs from it. */
+export interface SignalsTab {
+  sheet: Sheet;
+  name: string;
+  /** Signal rows below the header. */
+  rows: number;
+  ids: Set<string>;
+  /** Null when the tab has no Created at value that can be read. */
+  newestCreatedAt: string | null;
+}
+
+/** A tab is a signals tab when its header row starts with SIGNAL_COLUMNS' headers, in order. */
+export function readSignalsTab(sheet: Sheet | null): SignalsTab | null {
+  if (!sheet || sheet.getLastRow() < 1 || sheet.getLastColumn() < SIGNAL_COLUMNS.length) return null;
+  const header = sheet.getRange(1, 1, 1, SIGNAL_COLUMNS.length).getDisplayValues()[0];
+  if (!SIGNAL_COLUMNS.every((column, index) => String(header[index]).trim() === column.header)) return null;
+
+  const rows = sheet.getLastRow() - 1;
+  const column = (index: number): string[] =>
+    rows > 0 ? sheet.getRange(2, index, rows, 1).getDisplayValues().map((row) => String(row[0]).trim()) : [];
+  return {
+    sheet,
+    name: sheet.getName(),
+    rows,
+    ids: new Set(column(SIGNAL_ID_COLUMN).filter((id) => id !== "")),
+    newestCreatedAt: newestCreatedAt(column(CREATED_AT_COLUMN)),
+  };
+}
+
+/** For the sidebar: whether the open tab is a signals tab, so "only new" can be offered. */
+export function getSignalsTabStatus(): { isSignalsTab: boolean; name: string; rows: number } {
+  try {
+    const tab = readSignalsTab(SpreadsheetApp.getActiveSheet());
+    return tab ? { isSignalsTab: true, name: tab.name, rows: tab.rows } : { isSignalsTab: false, name: "", rows: 0 };
+  } catch {
+    return { isSignalsTab: false, name: "", rows: 0 };
+  }
+}
+
+/**
+ * What the signals view sends. Every field is optional and an empty one is
+ * no filter.
+ */
+export interface SignalsImportRequest {
+  /** Website domains: the sidebar's box as typed, or a list. */
+  domains?: string | string[];
+  types?: string[];
+  /** Two-letter codes of where the companies are headquartered. */
+  countries?: string[];
+  companySizes?: string[];
+  /** Job categories the signals must be about, e.g. Technology. */
+  functions?: string[];
+  minStrength?: number;
+  /** yyyy-MM-dd, inclusive. */
+  detectedAfter?: string;
+  excludeAgencies?: boolean;
+  /** Append to the open signals tab, reading only what is new since its newest signal. */
+  onlyNew?: boolean;
+  limit?: number;
+}
+
+/**
+ * HIRING_SIGNAL_FILTERS keys this connector sends, checked against the core by
+ * a test. The rest stay in the dashboard and the API: a sheet is for a list
+ * of companies and what changed in their hiring, not for every focus filter.
+ */
+export const SHEETS_SIGNAL_FILTER_KEYS: readonly string[] = [
+  "types",
+  "domains",
+  "countries",
+  "company_sizes",
+  "functions",
+  "min_strength",
+  "detected_after",
+  "exclude_agencies",
+  "created_after",
+];
+
+/** Sidebar request → connector-core signal filters (without the domains, which are read in chunks). */
+export function toSignalFilters(req: SignalsImportRequest): HiringSignalFilters {
+  return {
+    types: req.types,
+    countries: (req.countries ?? []).map((code) => String(code ?? "").trim().toUpperCase()),
+    company_sizes: req.companySizes,
+    functions: req.functions,
+    min_strength: req.minStrength,
+    detected_after: req.detectedAfter || undefined,
+    exclude_agencies: req.excludeAgencies === true,
+  };
+}
+
+/** True when a filter other than the domains says which companies or subjects are wanted. */
+function hasNarrowingFilter(filters: HiringSignalFilters): boolean {
+  const query = toSignalsQuery(filters);
+  return NARROWING_SIGNAL_FILTER_KEYS.some((key) => query[key] !== undefined);
+}
+
+/** Human-readable message for a failed signals read. */
+export function describeSignalsFailure(status: number, body: unknown): string {
+  const fields = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const code = typeof fields.code === "string" ? fields.code : null;
+
+  if (status === 402) {
+    return (
+      "Your plan's included signals and your Jobo wallet do not cover the next page of signals, so it was not " +
+      "read and nothing was charged for it. Top up your wallet at https://enterprise.jobo.world/credits?src=sheets, " +
+      "or import fewer signals."
+    );
+  }
+  if (status === 403 && code === "account_key_required") {
+    return (
+      "Hiring Signals is billed to a Jobo account, and this API key does not belong to one. Click Disconnect at " +
+      "the bottom of the sidebar, then sign in with Jobo or paste a key from https://enterprise.jobo.world/api-keys?src=sheets."
+    );
+  }
+  if (status === 404 && code === "not_available_in_sandbox") {
+    return (
+      "Hiring Signals is not available with a sandbox key. Click Disconnect at the bottom of the sidebar, then " +
+      "sign in with Jobo or paste a live key (jbe_live_…)."
+    );
+  }
+  if (status === 429) {
+    return (
+      "Jobo rate limit reached. Without a subscription, Hiring Signals takes 20 requests a minute, 200 an hour " +
+      "and 1,000 a day. Wait a minute and try again."
+    );
+  }
+  if (status === 400 && fields.errors && typeof fields.errors === "object") {
+    // A validation problem: the first message names the filter and what it takes.
+    for (const messages of Object.values(fields.errors as Record<string, unknown>)) {
+      if (Array.isArray(messages) && typeof messages[0] === "string") return messages[0];
+    }
+  }
+  return describeFailure(status, body);
+}
+
+function counted(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/** What was billed, and what is left of the included signals and the wallet. */
+function signalsUsageText(read: number, usage: Usage): string {
+  if (read === 0) return " Nothing was billed.";
+  const billed = usage.reported
+    ? ` Billed for ${counted(read, "signal")}.`
+    : ` Read ${counted(read, "signal")}; Jobo reported no charge for them.`;
+  const included =
+    usage.quotaRemaining != null
+      ? ` Included signals left this month: ${usage.quotaRemaining}${usage.quotaLimit != null ? ` of ${usage.quotaLimit}` : ""}.`
+      : "";
+  return `${billed}${walletText(usage)}${included}`;
+}
+
+/**
+ * Reads hiring signals into a new "Jobo Signals" tab, or with `onlyNew` adds
+ * the new ones to the open signals tab.
+ *
+ * `limit` caps the signals *read*, which is what is billed. Each request asks
+ * for no more than is left of it, so an import never reads past the cap.
+ * Domains are read in chunks of at most 100 (the API's limit per list), one
+ * after another, sharing that cap.
+ *
+ * An import into a new tab reads the newest detection day first. "Only new"
+ * reads the stored order, oldest first, from the tab's newest signal on: with
+ * one chunk of domains, an import that stops early is carried on exactly by
+ * the next one, because what it wrote is everything stored up to its last row.
+ *
+ * As for jobs, each page is written as it arrives, a lost answer is not asked
+ * for again, and no request is started after IMPORT_TIME_BUDGET_MS.
+ */
+export function importSignals(req: SignalsImportRequest): { ok: boolean; message: string } {
+  try {
+    const key = apiKey();
+    const limit = Math.min(Math.max(Math.trunc(req.limit ?? 0) || SIGNAL_DEFAULT_LIMIT, 1), SIGNALS_IMPORT_MAX);
+    const deadline = Date.now() + IMPORT_TIME_BUDGET_MS;
+
+    const { domains, rejected } = cleanDomains(req.domains);
+    if (rejected.length > 0) {
+      return {
+        ok: false,
+        message: `Not a website domain: ${rejected.slice(0, 5).join(", ")}. Enter domains such as stripe.com, one per line or separated by commas.`,
+      };
+    }
+    const filters = toSignalFilters(req);
+    const badCountry = (filters.countries ?? []).find((code) => code !== "" && !/^[A-Z]{2}$/.test(code));
+    if (badCountry !== undefined) {
+      return { ok: false, message: `Company countries take two-letter codes, such as US or DE. "${badCountry}" is not one.` };
+    }
+    // Builds the query once, so a value that contains a comma is refused
+    // (by toSignalsQuery, with the filter's name) before anything is read.
+    const narrowed = hasNarrowingFilter(filters);
+    if (domains.length === 0 && !narrowed) {
+      return {
+        ok: false,
+        message:
+          "Add the website domains of the companies you want, or choose at least one signal type, company " +
+          "country, company size or function. Without one the import reads signals from every company Jobo " +
+          "tracks, and each signal is billed.",
+      };
+    }
+
+    let tab: SignalsTab | null = null;
+    // True for "only new" with a signal in the tab to read after. A signals
+    // tab with no rows yet is read like a new one, newest detection day
+    // first: the stored order without a bound starts at the oldest signal
+    // Jobo holds.
+    let storedOrder = false;
+    if (req.onlyNew) {
+      tab = readSignalsTab(SpreadsheetApp.getActiveSheet());
+      if (!tab) {
+        return {
+          ok: false,
+          message:
+            "“Only new signals” adds to the signals tab that is open, and the open tab is not one. Open the " +
+            "signals tab to add to, or untick Only new signals to import into a new tab.",
+        };
+      }
+      if (tab.rows > 0 && tab.newestCreatedAt == null) {
+        return {
+          ok: false,
+          message:
+            `“${tab.name}” has no Created at value this add-on can read, so it cannot tell which signals are ` +
+            "new. Untick Only new signals to import into a new tab.",
+        };
+      }
+      const bound = signalsReadBound(tab.newestCreatedAt);
+      if (bound) {
+        filters.created_after = bound;
+        storedOrder = true;
+      }
+    }
+
+    const sheet = sheetWriter(SIGNAL_COLUMNS, "Jobo Signals", tab ? tab.sheet : null);
+    // Nothing in the tab is asked for again, so this set should never match.
+    // It stays as the last guard against writing a signal twice, and the
+    // result message says so if it ever does.
+    const known = new Set(tab ? tab.ids : []);
+    const chunks: string[][] = [];
+    for (let i = 0; i < domains.length; i += SIGNAL_MAX_LIST_VALUES) chunks.push(domains.slice(i, i + SIGNAL_MAX_LIST_VALUES));
+    if (chunks.length === 0) chunks.push([]);
+
+    const usage = newUsage();
+    let read = 0;
+    let skipped = 0;
+    let requests = 0;
+    let failure: string | null = null;
+    let outOfTime = false;
+    let moreMatched = false;
+    let unreadDomains = 0;
+
+    reading: for (let c = 0; c < chunks.length; c++) {
+      let cursor: string | undefined;
+      for (;;) {
+        if (read >= limit) {
+          // Stopped by the cap: either this chunk had another page, or
+          // chunks of domains are left that were never asked about.
+          if (cursor) moreMatched = true;
+          else for (let rest = c; rest < chunks.length; rest++) unreadDomains += chunks[rest].length;
+          break reading;
+        }
+        if (requests > 0 && Date.now() >= deadline) {
+          outOfTime = true;
+          break reading;
+        }
+
+        // The order goes on every page: a cursor continues the order it was issued under.
+        const query = toSignalsQuery(
+          { ...filters, domains: chunks[c].length > 0 ? chunks[c] : undefined },
+          { limit: Math.min(SIGNAL_MAX_LIMIT, limit - read), cursor, ...(storedOrder ? { sort: SIGNAL_POLL_SORT } : {}) },
+        );
+        requests++;
+        // Billed per signal returned, so never replayed after a lost answer.
+        let result: ApiResult;
+        try {
+          result = request(`/api/signals${buildQuery(query)}`, key, undefined, { replaySafe: false, deadline });
+        } catch (err) {
+          failure = (err as Error).message;
+          break reading;
+        }
+        if (result.status < 200 || result.status >= 300) {
+          failure = describeSignalsFailure(result.status, result.body);
+          break reading;
+        }
+        addUsage(usage, result);
+
+        const page = (result.body ?? {}) as Partial<HiringSignalListResponse>;
+        const batch = Array.isArray(page.signals) ? page.signals : [];
+        read += batch.length;
+        const fresh = batch.filter((signal) => signal && !known.has(signal.id));
+        skipped += batch.length - fresh.length;
+        for (const signal of fresh) known.add(signal.id);
+        try {
+          sheet.append(fresh);
+        } catch (err) {
+          failure = `Writing to the sheet failed: ${(err as Error).message}`;
+          break reading;
+        }
+
+        cursor = page.has_more && page.next_cursor ? page.next_cursor : undefined;
+        if (!cursor || batch.length === 0) break;
+      }
+    }
+
+    const written = sheet.written();
+    const spent = signalsUsageText(read, usage);
+    const overlapNote =
+      skipped > 0
+        ? ` ${counted(skipped, "signal")} ${skipped === 1 ? "was" : "were"} already in the tab and left out, ` +
+          `and ${skipped === 1 ? "is" : "are"} billed again.`
+        : "";
+
+    if (written === 0) {
+      if (failure != null) return { ok: false, message: read > 0 ? `${failure}${overlapNote}${spent}` : failure };
+      if (read > 0) return { ok: true, message: `No new signals.${overlapNote}${spent}` };
+      return {
+        ok: true,
+        message: tab
+          ? `No new signals since the last import into “${tab.name}”. Nothing was billed.`
+          : "No signals matched those filters. Nothing was billed.",
+      };
+    }
+
+    sheet.finish();
+
+    const head = tab
+      ? `Added ${counted(written, "new signal")} to “${sheet.name()}”.`
+      : `Imported ${counted(written, "signal")} into “${sheet.name()}”.`;
+    let stopped = "";
+    if (failure != null) stopped = ` The import stopped early: ${failure}`;
+    else if (outOfTime) stopped = " The import stopped early to finish inside Google's 6-minute limit for one run.";
+    else if (moreMatched) stopped = ` More signals matched than the ${limit} asked for.`;
+    else if (unreadDomains > 0) {
+      stopped = ` The ${limit} signals asked for were reached before ${counted(unreadDomains, "domain")} could be read.`;
+    }
+    // What an import that stopped early leaves behind, and whether a later
+    // "only new" import goes back for it.
+    //  - Stored order, one chunk of domains: the rows written are everything
+    //    stored up to the last one, so the next "only new" import carries on
+    //    exactly there.
+    //  - Otherwise it does not. A new tab is read newest detection day first,
+    //    and several chunks of domains are read one after another, so what
+    //    was not reached can be older than the newest signal written, and
+    //    "only new" reads only after that one.
+    const resumable = storedOrder && chunks.length === 1;
+    const incomplete = !stopped
+      ? ""
+      : resumable
+        ? " Signals are read in the order Jobo stored them, so the next “Only new signals” import continues " +
+          "after the last one added."
+        : " A later “Only new signals” import reads only signals stored after the newest one in the tab, so it " +
+          "will not pick up the ones this import did not reach. To get them, import again into a new tab with a " +
+          "higher How many signals or narrower filters.";
+    return {
+      ok: failure == null && !outOfTime,
+      message: `${head}${stopped}${incomplete}${overlapNote}${spent}`,
+    };
+  } catch (err) {
+    return { ok: false, message: (err as Error).message };
+  }
 }
 
 export function uniqueSheetName(
@@ -1247,6 +1899,7 @@ const globals = globalThis as unknown as Record<string, unknown>;
 globals.onOpen = onOpen;
 globals.onInstall = onInstall;
 globals.showSidebar = showSidebar;
+globals.showSignalsSidebar = showSignalsSidebar;
 globals.getSettings = getSettings;
 globals.saveApiKey = saveApiKey;
 globals.getConnectionStatus = getConnectionStatus;
@@ -1261,3 +1914,6 @@ globals.suggestLocations = suggestLocations;
 globals.suggestCompanies = suggestCompanies;
 globals.getOccupations = getOccupations;
 globals.importJobs = importJobs;
+globals.getSelectedDomains = getSelectedDomains;
+globals.getSignalsTabStatus = getSignalsTabStatus;
+globals.importSignals = importSignals;

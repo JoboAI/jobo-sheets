@@ -4,24 +4,39 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, it } from "node:test";
 
 import {
+  SHEETS_SIGNAL_FILTER_KEYS,
   SHEETS_SUPPORTED_FILTER_KEYS,
+  SIGNAL_COLUMNS,
+  SIGNAL_TYPE_GROUPS,
   authCallback,
   buildQuery,
+  cleanDomains,
   codeChallenge,
   companyPickerItem,
   createCodeVerifier,
   describeFailure,
+  describeSignalsFailure,
   disconnect,
   flattenOccupations,
   formatLocation,
   getConnectionStatus,
+  getSelectedDomains,
+  getSettings,
+  getSignalsTabStatus,
   importJobs,
   importPageSize,
+  importSignals,
   isRetryableResponse,
   neutralizeFormula,
+  newestCreatedAt,
   oauthRedirectUri,
   occupationLevelOptions,
+  onOpen,
   saveApiKey,
+  showSidebar,
+  showSignalsSidebar,
+  signalTypeGroups,
+  signalsReadBound,
   startSignIn,
   toCoreError,
   toSearchFilters,
@@ -29,9 +44,13 @@ import {
 } from "./Code.js";
 import {
   FeedCursorRestartRequiredError,
+  HIRING_SIGNAL_FILTERS,
   InsufficientCreditsError,
   JOB_SEARCH_FILTERS,
   RateLimitError,
+  SIGNAL_TYPES,
+  SIGNAL_TYPE_LABELS,
+  type HiringSignal,
   type Job,
 } from "@jobo-ai/connector-core";
 
@@ -82,30 +101,53 @@ afterEach(() => {
   Date.now = realDateNow;
 });
 
+/** A tab in the fake spreadsheet: its name and its cells, row 1 first. */
+interface FakeTab {
+  name: string;
+  grid: unknown[][];
+}
+
 /**
- * Just enough of the Apps Script runtime for importJobs: a saved key, a
+ * Just enough of the Apps Script runtime for the imports: a saved key, a
  * scripted UrlFetchApp (an Error entry is thrown, like a network fault), a
- * spreadsheet that records each setValues call, and a clock that only moves
- * when a request takes time or the code sleeps.
+ * spreadsheet whose tabs are grids and which records each setValues and
+ * setNumberFormat call, and a clock that only moves when a request takes
+ * time or the code sleeps.
  */
-function installAppsScript(responses: Array<FakeResponse | Error>): {
+function installAppsScript(
+  responses: Array<FakeResponse | Error>,
+  options: {
+    /** The open tab, when there is one before the import. */
+    active?: FakeTab;
+    /** The selected cells' display values. */
+    selection?: unknown[][];
+    /** Where the clock starts, epoch ms. */
+    now?: number;
+  } = {},
+): {
   urls: string[];
   bodies: Array<Record<string, unknown> | null>;
   /** Every setValues call: the row it started at and the rows it wrote. */
   written: Array<{ row: number; rows: unknown[][] }>;
-  /** The sheet as it stands: header row first. */
+  /** The first tab the import created, as it stands: header row first. */
   sheet: () => unknown[][];
+  /** Every tab the import created. */
+  inserted: FakeTab[];
+  /** Every setNumberFormat call. */
+  formats: Array<{ row: number; column: number; rows: number; columns: number; format: string }>;
   sleeps: number[];
-  /** What had happened, in order: "fetch", "write" and "flush". */
+  /** What had happened, in order: "fetch", "format", "write" and "flush". */
   events: string[];
 } {
   const urls: string[] = [];
   const bodies: Array<Record<string, unknown> | null> = [];
   const written: Array<{ row: number; rows: unknown[][] }> = [];
+  const formats: Array<{ row: number; column: number; rows: number; columns: number; format: string }> = [];
+  const inserted: FakeTab[] = [];
   const sleeps: number[] = [];
   const events: string[] = [];
   const g = globalThis as unknown as Record<string, unknown>;
-  let now = 1_000_000;
+  let now = options.now ?? 1_000_000;
   Date.now = () => now;
 
   g.PropertiesService = { getUserProperties: () => ({ getProperty: () => "jbe_test_key" }) };
@@ -131,33 +173,64 @@ function installAppsScript(responses: Array<FakeResponse | Error>): {
       };
     },
   };
+  const fakeSheet = (tab: FakeTab) => ({
+    getName: () => tab.name,
+    getLastRow: () => tab.grid.length,
+    getLastColumn: () => Math.max(0, ...tab.grid.map((r) => r.length)),
+    getRange: (row: number, column: number, numRows: number, numColumns: number) => {
+      const cells = (): unknown[][] =>
+        Array.from({ length: numRows }, (_, i) =>
+          Array.from({ length: numColumns }, (_, j) => tab.grid[row - 1 + i]?.[column - 1 + j] ?? ""),
+        );
+      return {
+        setValues: (rows: unknown[][]) => {
+          assert.equal(rows.length, numRows, "setValues needs exactly the rows its range has");
+          for (const r of rows) assert.equal(r.length, numColumns);
+          events.push("write");
+          written.push({ row, rows });
+          rows.forEach((r, i) => {
+            const target = (tab.grid[row - 1 + i] ??= []);
+            r.forEach((value, j) => (target[column - 1 + j] = value));
+          });
+        },
+        getValues: cells,
+        getDisplayValues: () => cells().map((r) => r.map((value) => String(value ?? ""))),
+        setFontWeight: () => undefined,
+        setNumberFormat: (format: string) => {
+          events.push("format");
+          formats.push({ row, column, rows: numRows, columns: numColumns, format });
+        },
+      };
+    },
+    setFrozenRows: () => undefined,
+    autoResizeColumns: () => undefined,
+  });
+
+  const tabs: FakeTab[] = options.active ? [options.active] : [];
+  let active: FakeTab | null = options.active ?? null;
   g.SpreadsheetApp = {
     flush: () => void events.push("flush"),
+    getActiveSheet: () => (active ? fakeSheet(active) : null),
+    getActiveRange: () =>
+      options.selection
+        ? { getDisplayValues: () => (options.selection as unknown[][]).map((r) => r.map((v) => String(v ?? ""))) }
+        : null,
     getActiveSpreadsheet: () => ({
-      getSheetByName: () => null,
-      insertSheet: () => ({
-        getRange: (row: number, _column: number, numRows: number, numColumns: number) => ({
-          setValues: (rows: unknown[][]) => {
-            assert.equal(rows.length, numRows, "setValues needs exactly the rows its range has");
-            for (const r of rows) assert.equal(r.length, numColumns);
-            events.push("write");
-            written.push({ row, rows });
-          },
-          setFontWeight: () => undefined,
-        }),
-        setFrozenRows: () => undefined,
-        autoResizeColumns: () => undefined,
-      }),
+      getSheetByName: (name: string) => tabs.find((tab) => tab.name === name) ?? null,
+      insertSheet: (name: string) => {
+        const tab: FakeTab = { name, grid: [] };
+        tabs.push(tab);
+        inserted.push(tab);
+        // As in Sheets, a new tab becomes the open one.
+        active = tab;
+        return fakeSheet(tab);
+      },
     }),
   };
 
-  const sheet = (): unknown[][] => {
-    const grid: unknown[][] = [];
-    for (const { row, rows } of written) rows.forEach((r, i) => (grid[row - 1 + i] = r));
-    return grid;
-  };
+  const sheet = (): unknown[][] => inserted[0]?.grid ?? [];
 
-  return { urls, bodies, written, sheet, sleeps, events };
+  return { urls, bodies, written, sheet, inserted, formats, sleeps, events };
 }
 
 const billedPage = (batch: Job[], totalPages: number): FakeResponse => ({
@@ -411,6 +484,654 @@ describe("importJobs", () => {
     assert.equal(sheet().length, 151);
     assert.equal(result.ok, true);
     assert.match(result.message, /^Imported 150 jobs\. Cost: \$0\.45 \(450 credits\)\./);
+  });
+});
+
+function signal(overrides: Partial<HiringSignal> = {}): HiringSignal {
+  return {
+    id: "sig-1",
+    type: "hiring_surge",
+    detected_on: "2026-11-10",
+    created_at: "2026-11-11T02:14:09.1234567Z",
+    window_start: "2026-11-04",
+    window_end: "2026-11-10",
+    strength: 88,
+    company: {
+      id: "company-1",
+      name: "Northwind Health",
+      domain: "northwind.example",
+      country_code: "US",
+      size: "1-10",
+      industry: "Hospitals and Health Care",
+      industries: ["Hospitals and Health Care"],
+      categories: [],
+      is_agency: false,
+      funding_stage: "Series B",
+      founded_year: 2012,
+    },
+    details: { new_jobs: 17, baseline_weekly_avg: 3.1 },
+    focus: {
+      functions: ["technology", "sales"],
+      title: "Senior Data Engineer",
+      seniority: "senior",
+      topics: ["snowflake"],
+      job_countries: ["US", "CA"],
+      job_regions: [],
+      job_cities: [],
+    },
+    evidence_job_ids: ["job-a", "job-b"],
+    ...overrides,
+  };
+}
+
+function signalBatch(count: number, offset = 0): HiringSignal[] {
+  return Array.from({ length: count }, (_, n) => signal({ id: `sig-${offset + n}` }));
+}
+
+const signalsPage = (batch: HiringSignal[], nextCursor?: string, headers: Record<string, string> = {}): FakeResponse => ({
+  status: 200,
+  body: { signals: batch, has_more: nextCursor !== undefined, ...(nextCursor ? { next_cursor: nextCursor } : {}) },
+  headers,
+});
+
+/** The query of a signals request, as the API reads it. */
+const queryOf = (url: string): Record<string, string> => Object.fromEntries(new URL(url).searchParams);
+
+const column = (header: string): number => SIGNAL_COLUMNS.findIndex((c) => c.header === header);
+
+/** A row of a signals tab the add-on wrote earlier. */
+function tabRow(id: string, createdAt: string): string[] {
+  return SIGNAL_COLUMNS.map((c) => (c.header === "Signal ID" ? id : c.header === "Created at" ? createdAt : "x"));
+}
+
+function signalsTab(rows: string[][], name = "Jobo Signals"): FakeTab {
+  return { name, grid: [SIGNAL_COLUMNS.map((c) => c.header), ...rows] };
+}
+
+describe("hiring signals: companies", () => {
+  it("cleans domains: trimmed, lower-cased, de-duplicated, without scheme, www., path or port", () => {
+    const typed = "https://www.Stripe.com/careers?x=1\nstripe.com, shopify.com;  ACME.co.uk:443 \n\nhttp://user@sub.example.org/#a\tWebsite";
+
+    assert.deepEqual(cleanDomains(typed), {
+      domains: ["stripe.com", "shopify.com", "acme.co.uk", "sub.example.org"],
+      rejected: ["Website"],
+    });
+    assert.deepEqual(cleanDomains(["notion.so", null, "", "www.notion.so/product", "localhost"]), {
+      domains: ["notion.so"],
+      rejected: ["localhost"],
+    });
+    assert.deepEqual(cleanDomains(undefined), { domains: [], rejected: [] });
+  });
+
+  it("fills the box from the selected cells, leaving out a header and blank cells", () => {
+    installAppsScript([], {
+      selection: [["Website", "Notes"], ["https://www.stripe.com/", ""], ["", ""], ["Stripe.com", "notion.so/product"]],
+    });
+
+    assert.deepEqual(getSelectedDomains(), { domains: ["stripe.com", "notion.so"], skipped: 2 });
+  });
+
+  it("finds no domains when nothing is selected", () => {
+    installAppsScript([]);
+
+    assert.deepEqual(getSelectedDomains(), { domains: [], skipped: 0 });
+  });
+});
+
+describe("importSignals", () => {
+  it("sends the sidebar's filters as the query of GET /api/signals", () => {
+    const { urls, bodies } = installAppsScript([signalsPage([signal()])]);
+
+    importSignals({
+      domains: "stripe.com\nshopify.com",
+      types: ["hiring_surge", "new_country"],
+      countries: ["us", " de "],
+      companySizes: ["51-200", "201-500"],
+      functions: ["Technology"],
+      minStrength: 70,
+      detectedAfter: "2026-11-01",
+      excludeAgencies: true,
+      limit: 50,
+    });
+
+    assert.equal(urls.length, 1);
+    assert.equal(new URL(urls[0]).origin + new URL(urls[0]).pathname, "https://connect.jobo.world/api/signals");
+    assert.equal(bodies[0], null, "a GET");
+    assert.deepEqual(queryOf(urls[0]), {
+      types: "hiring_surge,new_country",
+      domains: "stripe.com,shopify.com",
+      countries: "US,DE",
+      company_sizes: "51-200,201-500",
+      functions: "Technology",
+      exclude_agencies: "true",
+      min_strength: "70",
+      detected_after: "2026-11-01",
+      limit: "50",
+    });
+  });
+
+  it("sends nothing for an untouched field", () => {
+    const { urls } = installAppsScript([signalsPage([])]);
+
+    importSignals({
+      domains: " \n ",
+      types: ["leadership_hire"],
+      countries: [],
+      companySizes: [],
+      functions: [],
+      minStrength: 0,
+      detectedAfter: "",
+      excludeAgencies: false,
+    });
+
+    assert.deepEqual(queryOf(urls[0]), { types: "leadership_hire", limit: "50" });
+  });
+
+  it("reads more than 100 domains in requests of at most 100 that share How many signals", () => {
+    const domains = Array.from({ length: 250 }, (_, n) => `company${n}.example`);
+    const { urls, sheet } = installAppsScript([
+      signalsPage(signalBatch(150), "c1"),
+      signalsPage(signalBatch(10, 150)),
+      signalsPage(signalBatch(100, 160), "c2"),
+    ]);
+
+    const result = importSignals({ domains: domains.join("\n"), limit: 260 });
+
+    assert.equal(urls.length, 3, "the third chunk is never asked for: the budget is spent");
+    const [first, second, third] = urls.map(queryOf);
+    assert.deepEqual(first.domains.split(","), domains.slice(0, 100));
+    assert.equal(first.limit, "200", "at most 200 a page");
+    assert.equal(first.cursor, undefined);
+    assert.deepEqual(second.domains.split(","), domains.slice(0, 100), "the same filters on the next page");
+    assert.equal(second.cursor, "c1");
+    assert.equal(second.limit, "110", "never more than is left of the 260");
+    assert.deepEqual(third.domains.split(","), domains.slice(100, 200));
+    assert.equal(third.cursor, undefined, "a new chunk starts from its first page");
+    assert.equal(third.limit, "100");
+
+    assert.equal(sheet().length, 261, "header + 260 signals");
+    assert.equal(result.ok, true);
+    assert.match(result.message, /^Imported 260 signals into “Jobo Signals”\. More signals matched than the 260 asked for\./);
+    assert.match(result.message, /will not pick up the ones this import did not reach/);
+  });
+
+  it("says how many domains were never read when the budget runs out between chunks", () => {
+    const domains = Array.from({ length: 150 }, (_, n) => `company${n}.example`);
+    const { urls } = installAppsScript([signalsPage(signalBatch(30))]);
+
+    const result = importSignals({ domains, limit: 30 });
+
+    assert.equal(urls.length, 1);
+    assert.match(result.message, /The 30 signals asked for were reached before 50 domains could be read\./);
+  });
+
+  it("writes one row per signal with every column, the summary from the core, and nothing that runs as a formula", () => {
+    const { sheet, formats, events } = installAppsScript([
+      signalsPage([signal({ company: { ...signal().company, name: '=HYPERLINK("https://evil.test")' } })]),
+    ]);
+
+    const result = importSignals({ types: ["hiring_surge"] });
+
+    assert.equal(result.ok, true);
+    const [header, row] = sheet();
+    assert.deepEqual(header, [
+      "Detected",
+      "Company",
+      "Domain",
+      "Signal",
+      "Summary",
+      "Strength",
+      "Strength band",
+      "Country",
+      "Company size",
+      "Industry",
+      "Funding stage",
+      "Functions",
+      "Role",
+      "Seniority",
+      "Topics",
+      "Job countries",
+      "Evidence job IDs",
+      "Created at",
+      "Signal ID",
+    ]);
+    assert.deepEqual(row, [
+      "2026-11-10",
+      `'=HYPERLINK("https://evil.test")`,
+      "northwind.example",
+      "Hiring surge",
+      "17 new jobs this week vs 3.1 a week normally",
+      88,
+      "Very strong",
+      "US",
+      "1-10",
+      "Hospitals and Health Care",
+      "Series B",
+      "technology, sales",
+      "Senior Data Engineer",
+      "senior",
+      "snowflake",
+      "US, CA",
+      "job-a, job-b",
+      "2026-11-11T02:14:09.1234567Z",
+      "sig-1",
+    ]);
+
+    // Plain text before the values land, so Sheets keeps all seven decimal
+    // places and does not read "1-10" as a date.
+    assert.deepEqual(
+      formats.map((f) => [f.row, f.column, f.rows, f.columns, f.format]),
+      [
+        [1, column("Company size") + 1, 2, 1, "@"],
+        [1, column("Created at") + 1, 2, 1, "@"],
+        [1, column("Signal ID") + 1, 2, 1, "@"],
+      ],
+    );
+    assert.deepEqual(events, ["fetch", "format", "format", "format", "write", "flush"]);
+  });
+
+  it("never fails on a signal type it does not know", () => {
+    const unknown = { ...signal({ id: "sig-new", type: "talent_exodus", details: { anything: 1 } }), focus: undefined };
+    const { sheet } = installAppsScript([signalsPage([unknown as unknown as HiringSignal])]);
+
+    const result = importSignals({ domains: "northwind.example" });
+
+    assert.equal(result.ok, true);
+    const row = sheet()[1];
+    assert.equal(row[column("Signal")], "Talent exodus");
+    assert.equal(row[column("Summary")], "Talent exodus");
+    assert.equal(row[column("Functions")], "");
+    assert.equal(row[column("Signal ID")], "sig-new");
+  });
+
+  it("writes each page before asking for the next, and keeps them when a later page fails", () => {
+    const { urls, sheet, events } = installAppsScript([signalsPage(signalBatch(200), "c1"), { status: 500 }]);
+
+    const result = importSignals({ types: ["hiring_surge"], limit: 400 });
+
+    assert.equal(urls.length, 2, "a billed read is not replayed after a 500");
+    assert.deepEqual(events.slice(0, 6), ["fetch", "format", "format", "format", "write", "flush"]);
+    assert.equal(events[6], "fetch");
+    assert.equal(sheet().length, 201);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^Imported 200 signals into “Jobo Signals”\. The import stopped early: Jobo returned HTTP 500\./);
+  });
+
+  it("stops starting requests near Google's time limit and says so", () => {
+    const slow = (batch: HiringSignal[], cursor: string): FakeResponse => ({ ...signalsPage(batch, cursor), takesMs: 150_000 });
+    const { urls, sheet } = installAppsScript([
+      slow(signalBatch(200), "c1"),
+      slow(signalBatch(200, 200), "c2"),
+      slow(signalBatch(200, 400), "c3"),
+    ]);
+
+    const result = importSignals({ types: ["hiring_surge"], limit: 1000 });
+
+    assert.equal(urls.length, 2);
+    assert.equal(sheet().length, 401);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /6-minute limit/);
+  });
+
+  it("reports what was billed and what is left of the included signals and the wallet", () => {
+    installAppsScript([
+      signalsPage(signalBatch(42), undefined, {
+        "X-Credits-Deducted": "360",
+        "X-Credits-Balance": "4200",
+        "X-Quota-Limit": "250",
+        "X-Quota-Remaining": "0",
+      }),
+    ]);
+
+    const result = importSignals({ types: ["hiring_surge"] });
+
+    assert.deepEqual(result, {
+      ok: true,
+      message:
+        "Imported 42 signals into “Jobo Signals”. Billed for 42 signals. Cost: $0.36 (360 credits). " +
+        "Wallet balance: $4.20. Included signals left this month: 0 of 250.",
+    });
+  });
+
+  it("does not claim a charge the API did not report", () => {
+    installAppsScript([signalsPage(signalBatch(3))]);
+
+    const result = importSignals({ types: ["hiring_surge"] });
+
+    assert.equal(result.message, "Imported 3 signals into “Jobo Signals”. Read 3 signals; Jobo reported no charge for them.");
+  });
+
+  it("creates no tab and bills nothing when nothing matches", () => {
+    const { inserted } = installAppsScript([signalsPage([])]);
+
+    const result = importSignals({ domains: "stripe.com" });
+
+    assert.deepEqual(result, { ok: true, message: "No signals matched those filters. Nothing was billed." });
+    assert.equal(inserted.length, 0);
+  });
+
+  it("names the next free tab when a Jobo Signals tab exists", () => {
+    const { inserted } = installAppsScript([signalsPage([signal()])], { active: signalsTab([]) });
+
+    const result = importSignals({ domains: "stripe.com" });
+
+    assert.equal(inserted[0].name, "Jobo Signals 2");
+    assert.match(result.message, /into “Jobo Signals 2”/);
+  });
+
+  it("requires domains or a filter that narrows the read, before anything is read", () => {
+    const { urls } = installAppsScript([]);
+
+    const result = importSignals({ minStrength: 80, excludeAgencies: true, detectedAfter: "2026-11-01" });
+
+    assert.equal(result.ok, false);
+    assert.match(result.message, /^Add the website domains of the companies you want, or choose at least one signal type/);
+    assert.equal(urls.length, 0);
+  });
+
+  it("refuses a value that contains a comma, what is not a domain, and a country that is not a code", () => {
+    const { urls, inserted } = installAppsScript([]);
+
+    const comma = importSignals({ domains: "stripe.com", functions: ["Sales, Marketing"] });
+    assert.equal(comma.ok, false);
+    assert.match(comma.message, /"Sales, Marketing" cannot be used in Functions/);
+
+    const notADomain = importSignals({ domains: "stripe.com\nAcme Corp" });
+    assert.match(notADomain.message, /^Not a website domain: Acme, Corp\./);
+
+    const country = importSignals({ domains: "stripe.com", countries: ["Germany"] });
+    assert.match(country.message, /two-letter codes.*"GERMANY" is not one/);
+
+    assert.equal(urls.length, 0);
+    assert.equal(inserted.length, 0);
+  });
+
+  it("explains a 402, a key without an account, a sandbox key, a rate limit and a bad filter", () => {
+    const cases: Array<[FakeResponse, RegExp]> = [
+      [{ status: 402, body: { error: "Insufficient credits" } }, /included signals and your Jobo wallet do not cover.*nothing was charged/],
+      [
+        { status: 403, body: { title: "Account API key required", code: "account_key_required" } },
+        /billed to a Jobo account, and this API key does not belong to one/,
+      ],
+      [{ status: 403, body: { title: "Forbidden" } }, /Jobo rejected the API key/],
+      [{ status: 404, body: { title: "Not available in the sandbox", code: "not_available_in_sandbox" } }, /not available with a sandbox key/],
+      [
+        { status: 400, body: { title: "One or more validation errors occurred.", errors: { min_strength: ["min_strength must be between 1 and 100."] } } },
+        /^min_strength must be between 1 and 100\.$/,
+      ],
+    ];
+    for (const [response, expected] of cases) {
+      const { urls, written } = installAppsScript([response]);
+
+      const result = importSignals({ domains: "stripe.com" });
+
+      assert.equal(result.ok, false);
+      assert.match(result.message, expected);
+      assert.equal(urls.length, 1, `${response.status} is not retried`);
+      assert.equal(written.length, 0);
+    }
+  });
+
+  it("waits out a rate limit before giving up with the limits that apply", () => {
+    const limited: FakeResponse = { status: 429, headers: { "Retry-After": "1" } };
+    const { urls, sleeps } = installAppsScript([limited, limited, limited]);
+
+    const result = importSignals({ domains: "stripe.com" });
+
+    assert.equal(urls.length, 3);
+    assert.deepEqual(sleeps, [1000, 1000]);
+    assert.match(result.message, /rate limit reached.*20 requests a minute, 200 an hour and 1,000 a day/);
+  });
+
+  it("describes failures directly too", () => {
+    assert.match(describeSignalsFailure(402, null), /Top up your wallet/);
+    assert.match(describeSignalsFailure(401, {}), /api-keys/);
+    assert.equal(describeSignalsFailure(500, null), "Jobo returned HTTP 500.");
+  });
+});
+
+describe("importSignals: only new", () => {
+  const NOON = Date.parse("2026-11-20T12:00:00Z");
+
+  it("reads the stored order from the tab's newest Created at, sent as written, and appends below the tab", () => {
+    // The newest is two minutes old: there is no settling time to wait out
+    // and no overlap, however fresh it is.
+    const tab = signalsTab([
+      tabRow("old-1", "2026-11-20T11:58:30.98765Z"),
+      tabRow("old-2", "2026-11-20T11:58:30.987654Z"),
+      tabRow("old-3", "2026-11-20T08:00:00Z"),
+    ]);
+    const { urls, written, inserted, formats } = installAppsScript(
+      [signalsPage([signal({ id: "new-1", created_at: "2026-11-20T11:00:00.0000001Z" })])],
+      { active: tab, now: NOON },
+    );
+
+    const result = importSignals({ domains: "stripe.com", onlyNew: true });
+
+    assert.equal(queryOf(urls[0]).sort, "created_asc", "the order a read can be carried on in");
+    assert.equal(queryOf(urls[0]).created_after, "2026-11-20T11:58:30.987654Z", "every digit, as written");
+    assert.equal(inserted.length, 0, "no new tab");
+    assert.deepEqual(
+      written.map(({ row, rows }) => [row, rows.length]),
+      [[5, 1]],
+      "below the header and the three rows, with no second header",
+    );
+    assert.equal(tab.grid[4][column("Signal ID")], "new-1");
+    assert.equal(tab.grid[4][column("Created at")], "2026-11-20T11:00:00.0000001Z");
+    assert.ok(formats.every((f) => f.row === 5 && f.rows === 1));
+    assert.equal(result.ok, true);
+    assert.match(result.message, /^Added 1 new signal to “Jobo Signals”\./);
+  });
+
+  it("carries on exactly after an import that stopped at How many signals", () => {
+    const tab = signalsTab([tabRow("old-1", "2026-11-20T11:00:00.000001Z")]);
+    const { urls } = installAppsScript(
+      [
+        signalsPage(signalBatch(200), "c1"),
+        signalsPage(signalBatch(50, 200), "c2"),
+      ],
+      { active: tab, now: NOON },
+    );
+
+    const result = importSignals({ domains: "stripe.com", onlyNew: true, limit: 250 });
+
+    const [first, second] = urls.map(queryOf);
+    assert.equal(second.cursor, "c1");
+    assert.equal(second.sort, "created_asc", "the cursor belongs to the stored order, so every page names it");
+    assert.equal(second.created_after, first.created_after, "the same bound on every page");
+    assert.match(result.message, /^Added 250 new signals to “Jobo Signals”\. More signals matched than the 250 asked for\./);
+    assert.match(result.message, /the next “Only new signals” import continues after the last one added/);
+    assert.doesNotMatch(result.message, /will not pick up/);
+  });
+
+  it("still warns when it stops early with more than 100 domains, which are read one hundred at a time", () => {
+    const domains = Array.from({ length: 150 }, (_, n) => `company${n}.example`);
+    const tab = signalsTab([tabRow("old-1", "2026-11-20T11:00:00.000001Z")]);
+    installAppsScript([signalsPage(signalBatch(100), "c1")], { active: tab, now: NOON });
+
+    const result = importSignals({ domains: domains.join("\n"), onlyNew: true, limit: 100 });
+
+    // The second hundred domains were never asked about, and their new
+    // signals can be older than the newest one just written.
+    assert.match(result.message, /will not pick up the ones this import did not reach/);
+    assert.doesNotMatch(result.message, /continues after the last one added/);
+  });
+
+  it("leaves out a signal the tab already holds, and says it was billed again", () => {
+    // Nothing in the tab is asked for again, so this should not happen. If the
+    // API returns one anyway, it is not written twice and the message says so.
+    const tab = signalsTab([tabRow("old-1", "2026-11-20T11:58:00.123456Z")]);
+    const { urls } = installAppsScript(
+      [
+        signalsPage([signal({ id: "old-1" }), signal({ id: "new-1" }), signal({ id: "new-2" })], undefined, {
+          "X-Quota-Limit": "250",
+          "X-Quota-Remaining": "197",
+          "X-Credits-Deducted": "0",
+        }),
+      ],
+      { active: tab, now: NOON },
+    );
+
+    const result = importSignals({ domains: "stripe.com", onlyNew: true });
+
+    assert.equal(queryOf(urls[0]).created_after, "2026-11-20T11:58:00.123456Z", "no reaching back");
+    assert.deepEqual(
+      tab.grid.slice(1).map((row) => row[column("Signal ID")]),
+      ["old-1", "new-1", "new-2"],
+      "old-1 is not written twice",
+    );
+    assert.equal(
+      result.message,
+      "Added 2 new signals to “Jobo Signals”. 1 signal was already in the tab and left out, and is billed again. " +
+        "Billed for 3 signals. Included signals left this month: 197 of 250.",
+    );
+  });
+
+  it("says so when everything read was already in the tab", () => {
+    const tab = signalsTab([tabRow("old-1", "2026-11-20T11:58:00Z")]);
+    installAppsScript([signalsPage([signal({ id: "old-1" })], undefined, { "X-Credits-Deducted": "30" })], {
+      active: tab,
+      now: NOON,
+    });
+
+    const result = importSignals({ domains: "stripe.com", onlyNew: true });
+
+    assert.equal(result.ok, true);
+    assert.match(result.message, /^No new signals\. 1 signal was already in the tab and left out/);
+    assert.equal(tab.grid.length, 2);
+  });
+
+  it("reads a signals tab that holds no signals yet like a new one: no bound, newest detection day first", () => {
+    const { urls } = installAppsScript([signalsPage([])], { active: signalsTab([]), now: NOON });
+
+    const result = importSignals({ domains: "stripe.com", onlyNew: true });
+
+    assert.equal(queryOf(urls[0]).created_after, undefined);
+    // The stored order without a bound would start at the oldest signal Jobo holds.
+    assert.equal(queryOf(urls[0]).sort, undefined);
+    assert.equal(result.message, "No new signals since the last import into “Jobo Signals”. Nothing was billed.");
+  });
+
+  it("refuses when the open tab is not a signals tab, or has no Created at it can read", () => {
+    for (const active of [
+      { name: "Leads", grid: [["Domain"], ["stripe.com"]] },
+      signalsTab([tabRow("old-1", "yesterday")]),
+    ]) {
+      const { urls, inserted } = installAppsScript([], { active, now: NOON });
+
+      const result = importSignals({ domains: "stripe.com", onlyNew: true });
+
+      assert.equal(result.ok, false);
+      assert.match(result.message, /[Uu]ntick Only new signals to import into a new tab/);
+      assert.equal(urls.length, 0);
+      assert.equal(inserted.length, 0);
+    }
+  });
+
+  it("tells the sidebar whether the open tab is a signals tab", () => {
+    installAppsScript([], { active: signalsTab([tabRow("a", "2026-11-20T11:00:00Z"), tabRow("b", "2026-11-20T11:01:00Z")]) });
+    assert.deepEqual(getSignalsTabStatus(), { isSignalsTab: true, name: "Jobo Signals", rows: 2 });
+
+    installAppsScript([], { active: { name: "Leads", grid: [["Company", "Domain"]] } });
+    assert.deepEqual(getSignalsTabStatus(), { isSignalsTab: false, name: "", rows: 0 });
+  });
+
+  it("uses the newest created_at as it is written, whatever its age or precision", () => {
+    for (const newest of ["2026-11-20T11:50:00.837281Z", "2026-11-20T11:50:00.83728Z", "2026-11-20T11:50:00Z"]) {
+      assert.equal(signalsReadBound(newest), newest);
+    }
+    assert.equal(signalsReadBound("  2026-11-20T11:50:00.5Z "), "2026-11-20T11:50:00.5Z");
+    assert.equal(signalsReadBound(null), null);
+    assert.equal(signalsReadBound("yesterday"), null);
+  });
+
+  it("compares created_at values to the seventh decimal place", () => {
+    assert.equal(
+      newestCreatedAt(["2026-11-20T09:15:30Z", "2026-11-20T09:15:30.0000001Z", "2026-11-20T09:15:29.9999999Z", "", "n/a"]),
+      "2026-11-20T09:15:30.0000001Z",
+    );
+    assert.equal(newestCreatedAt(["2026-11-20T09:15:30.5+01:00", "2026-11-20T08:15:30.4Z"]), "2026-11-20T09:15:30.5+01:00");
+    assert.equal(newestCreatedAt([]), null);
+  });
+});
+
+describe("hiring signals: sidebar", () => {
+  it("adds both imports to the Extensions menu", () => {
+    const items: Array<[string, string]> = [];
+    (globalThis as unknown as Record<string, unknown>).SpreadsheetApp = {
+      getUi: () => ({
+        createAddonMenu: () => {
+          const menu = {
+            addItem: (caption: string, fn: string) => (items.push([caption, fn]), menu),
+            addToUi: () => undefined,
+          };
+          return menu;
+        },
+      }),
+    };
+
+    onOpen();
+
+    assert.deepEqual(items, [
+      ["Import jobs…", "showSidebar"],
+      ["Import hiring signals…", "showSignalsSidebar"],
+    ]);
+    for (const [, fn] of items) assert.equal(typeof (globalThis as unknown as Record<string, unknown>)[fn], "function");
+  });
+
+  it("opens the one sidebar on the view the menu item names", () => {
+    const shown: Array<{ file: string; view: unknown; title: string }> = [];
+    const g = globalThis as unknown as Record<string, unknown>;
+    g.HtmlService = {
+      createTemplateFromFile: (file: string) => {
+        const template: Record<string, unknown> = {};
+        template.evaluate = () => {
+          const page = { file, view: template.view, title: "" };
+          shown.push(page);
+          const output = { setTitle: (title: string) => ((page.title = title), output) };
+          return output;
+        };
+        return template;
+      },
+    };
+    g.SpreadsheetApp = { getUi: () => ({ showSidebar: () => undefined }) };
+
+    showSidebar();
+    showSignalsSidebar();
+
+    assert.deepEqual(shown, [
+      { file: "Sidebar", view: "jobs", title: "Career Site Jobs" },
+      { file: "Sidebar", view: "signals", title: "Hiring Signals" },
+    ]);
+  });
+
+  it("groups every signal type the way the dashboard does, with the core's labels", () => {
+    const groups = signalTypeGroups();
+
+    assert.deepEqual(
+      groups.map((group) => group.label),
+      ["Growth", "Expansion", "Leadership", "Tech and skills", "Slowing or struggling"],
+    );
+    const offered = groups.flatMap((group) => group.types.map((type) => type.value));
+    assert.deepEqual([...offered].sort(), [...SIGNAL_TYPES].sort(), "each type once, none missing");
+    for (const group of groups) {
+      for (const type of group.types) assert.equal(type.label, SIGNAL_TYPE_LABELS[type.value]);
+    }
+    assert.deepEqual(SIGNAL_TYPE_GROUPS[0].types, ["hiring_surge", "function_surge", "hiring_resumed"]);
+  });
+
+  it("hands the sidebar the signal types and company sizes", () => {
+    installSignIn([], { JOBO_API_KEY: LIVE_KEY });
+
+    const settings = getSettings();
+
+    assert.deepEqual(settings.signalTypeGroups, signalTypeGroups());
+    assert.deepEqual(settings.companySizes, HIRING_SIGNAL_FILTERS.find((f) => f.key === "company_sizes")?.options);
+  });
+
+  it("sends only filters the signals API has", () => {
+    const keys = HIRING_SIGNAL_FILTERS.map((filter) => filter.key as string);
+    for (const key of SHEETS_SIGNAL_FILTER_KEYS) assert.ok(keys.includes(key), `"${key}" is not a signals filter`);
   });
 });
 
@@ -1091,6 +1812,14 @@ describe("built sidebar", () => {
     assert.ok(sidebar.includes(readFileSync(new URL("combobox.css", ui), "utf8")));
     assert.ok(sidebar.includes(readFileSync(new URL("combobox.js", ui), "utf8").replace(/^export /gm, "")));
     assert.ok(!sidebar.includes("@inline:"), "every marker was replaced");
+  });
+
+  it("is a template with one scriptlet: the view, escaped, on the body", () => {
+    const sidebar = readFileSync(new URL("../dist/Sidebar.html", import.meta.url), "utf8");
+
+    // The template engine runs a scriptlet tag wherever it appears, inlined code included.
+    assert.equal(sidebar.split("<?").length - 1, 1);
+    assert.ok(sidebar.includes('<body data-view="<?= view ?>">'));
   });
 });
 

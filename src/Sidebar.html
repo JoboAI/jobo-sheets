@@ -11,6 +11,11 @@
        * body, 36px inputs, hairline-divided sections, mono eyebrow section
        * labels (the only uppercase text). Square everywhere — only the
        * spinner is round.
+       *
+       * This file is an Apps Script template, for one value: the view the
+       * menu item asked for, printed into data-view on the body. Keep
+       * scriptlet tags out of everything else, comments included, since the
+       * template engine runs them wherever they appear.
        */
       body {
         font-family: var(--jobo-font-sans);
@@ -60,7 +65,8 @@
       input[type="text"]:not(.jobo-cb-input),
       input[type="password"],
       input[type="number"],
-      input[type="date"] {
+      input[type="date"],
+      textarea {
         width: 100%;
         box-sizing: border-box;
         height: 36px;
@@ -75,6 +81,18 @@
       }
       input[type="number"] {
         font-variant-numeric: tabular-nums;
+      }
+      textarea {
+        height: auto;
+        padding: 8px 10px;
+        resize: vertical;
+        line-height: 1.45;
+      }
+      /* A group of signal type checkboxes: Growth, Expansion, … */
+      p.group {
+        font-size: 11px;
+        color: var(--jobo-ink-600);
+        margin: 8px 0 4px;
       }
       select {
         width: 100%;
@@ -96,9 +114,11 @@
       details p.hint {
         margin: 6px 0 0;
       }
-      input:not(.jobo-cb-input):hover {
+      input:not(.jobo-cb-input):hover,
+      textarea:hover {
         border-color: var(--jobo-ink-500);
       }
+      textarea:focus,
       input:not(.jobo-cb-input):focus {
         outline: none;
         border-color: var(--jobo-ring);
@@ -280,7 +300,7 @@
       }
     </style>
   </head>
-  <body>
+  <body data-view="<?= view ?>">
     <div id="setup" style="display: none">
       <p class="eyebrow">Connection</p>
       <h2>Connect to Jobo</h2>
@@ -314,6 +334,7 @@
         Results are written to a new sheet. Imported jobs use your plan's included jobs first, so narrow
         the filters to keep usage predictable.
       </p>
+      <button class="link" data-show-view="signals" style="margin: 0">Import hiring signals instead</button>
 
       <label for="q">Search</label>
       <input type="text" id="q" placeholder="e.g. rust engineer" />
@@ -400,7 +421,69 @@
       <button class="primary" id="run">Import</button>
       <div class="spinner" id="spinner"></div>
       <div class="status" id="status"></div>
+    </div>
 
+    <div id="signals" style="display: none">
+      <p class="eyebrow">Hiring signals</p>
+      <h2>Import hiring signals</h2>
+      <p class="hint">
+        What changed in companies' hiring: a surge, a first job in a new country, a leadership search, a new
+        technology, a slowdown. Results are written to a new sheet.
+        <a href="https://jobo.world/docs/guides/hiring-signals" target="_blank" rel="noopener">About signals</a>
+      </p>
+      <button class="link" data-show-view="jobs" style="margin: 0">Import jobs instead</button>
+
+      <label for="domains">Companies</label>
+      <textarea id="domains" rows="5" placeholder="Website domains, one per line or separated by commas, e.g. stripe.com"></textarea>
+      <button class="link" id="domainsFromSelection">Add the domains in the selected cells</button>
+      <p class="hint" style="margin: 6px 0 0">
+        Optional. Without domains, choose signal types, company countries, company sizes or functions below.
+      </p>
+
+      <label>Signal types</label>
+      <div id="signalTypes"></div>
+
+      <label id="signalCountriesLabel">Company countries</label>
+      <div id="signalCountries"></div>
+
+      <label>Company sizes</label>
+      <div class="checks" id="companySizes"></div>
+
+      <label id="signalFunctionsLabel">Functions</label>
+      <div id="signalFunctions"></div>
+
+      <label for="minStrength">Minimum strength (1 to 100)</label>
+      <input type="number" id="minStrength" min="1" max="100" placeholder="Compares signals of the same type" />
+
+      <label for="detectedAfter">Detected on or after</label>
+      <input type="date" id="detectedAfter" />
+
+      <label class="checks" style="margin-top: 10px">
+        <input type="checkbox" id="excludeAgencies" />
+        Exclude staffing agencies
+      </label>
+
+      <div id="onlyNewRow" style="display: none">
+        <label class="checks" style="margin-top: 10px">
+          <input type="checkbox" id="onlyNew" checked />
+          Only signals new since the last import into this tab
+        </label>
+        <p class="hint" id="onlyNewHint" style="margin: 6px 0 0"></p>
+      </div>
+
+      <label for="signalLimit">How many signals</label>
+      <input type="number" id="signalLimit" min="1" max="1000" value="50" />
+      <p class="hint" style="margin: 6px 0 0">
+        Each signal imported is billed at ten times the price of a job, from your plan's included signals first.
+        An import with nothing to return costs nothing.
+      </p>
+
+      <button class="primary" id="runSignals">Import signals</button>
+      <div class="spinner" id="signalsSpinner"></div>
+      <div class="status" id="signalsStatus"></div>
+    </div>
+
+    <div id="account" style="display: none">
       <hr />
       <p class="hint" id="connectedAs" style="margin: 0"></p>
       <button class="link" id="disconnect">Disconnect</button>
@@ -417,6 +500,8 @@
     </script>
     <script>
       var STATE = null;
+      /** 'jobs' or 'signals': which menu item opened the sidebar, until a link switches it. */
+      var VIEW = document.body.getAttribute('data-view') === 'signals' ? 'signals' : 'jobs';
       var locationBox = null;
       /** Multi-value pickers by element id; each is a createJoboCombobox handle. */
       var boxes = {};
@@ -431,8 +516,8 @@
         });
       }
 
-      function setStatus(message, ok) {
-        var box = el('status');
+      function setStatus(message, ok, id) {
+        var box = el(id || 'status');
         box.textContent = message;
         box.className = ok ? 'status ok' : 'status err';
       }
@@ -534,8 +619,21 @@
           mountPicker(id, { placeholder: 'Loading occupations…' });
         });
 
+        // Signals: countries are two-letter codes, typed; functions are job
+        // categories, suggested once the filter options arrive.
+        mountPicker('signalCountries', { allowFreeText: true, placeholder: 'e.g. US, DE — press Enter to add' });
+        mountPicker('signalFunctions', { allowFreeText: true, placeholder: 'e.g. Technology — press Enter to add' });
+
         serverCall('getFilterOptions').then(function (options) {
           if (!options || !options.ok) return; // keep free-text fallback
+          if (options.jobCategories && options.jobCategories.length > 0) {
+            mountPicker('signalFunctions', {
+              fetchSuggestions: localFilter(options.jobCategories, 40),
+              allowFreeText: true,
+              minChars: 1,
+              placeholder: 'e.g. Technology, Sales'
+            });
+          }
           if (options.sources.length > 0) {
             mountPicker('sources', { fetchSuggestions: localFilter(toItems(options.sources)), minChars: 1, placeholder: 'Start typing to see sources' });
           }
@@ -589,6 +687,35 @@
           label.appendChild(input);
           label.appendChild(document.createTextNode(value));
           container.appendChild(label);
+        });
+      }
+
+      /** Checkboxes whose value and label differ: items are {value, label}. */
+      function renderLabelledChecks(container, items) {
+        items.forEach(function (item) {
+          var label = document.createElement('label');
+          var input = document.createElement('input');
+          input.type = 'checkbox';
+          input.value = item.value;
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(item.label));
+          container.appendChild(label);
+        });
+      }
+
+      /** Signal types under their dashboard groups: Growth, Expansion, … */
+      function renderSignalTypes(groups) {
+        var container = el('signalTypes');
+        container.innerHTML = '';
+        groups.forEach(function (group) {
+          var heading = document.createElement('p');
+          heading.className = 'group';
+          heading.textContent = group.label;
+          var checks = document.createElement('div');
+          checks.className = 'checks';
+          renderLabelledChecks(checks, group.types);
+          container.appendChild(heading);
+          container.appendChild(checks);
         });
       }
 
@@ -707,11 +834,19 @@
         checkConnection(run).then(again, again);
       }
 
+      /** Shows the jobs or the signals view; the setup view stands in for both until connected. */
+      function showView() {
+        var connected = Boolean(STATE && STATE.hasKey);
+        el('setup').style.display = connected ? 'none' : 'block';
+        el('main').style.display = connected && VIEW === 'jobs' ? 'block' : 'none';
+        el('signals').style.display = connected && VIEW === 'signals' ? 'block' : 'none';
+        el('account').style.display = connected ? 'block' : 'none';
+        if (connected && VIEW === 'signals') refreshSignalsTab();
+      }
+
       function show(settings) {
         STATE = settings;
         stopSignIn();
-        el('setup').style.display = settings.hasKey ? 'none' : 'block';
-        el('main').style.display = settings.hasKey ? 'block' : 'none';
         if (settings.hasKey) {
           el('connectedAs').textContent = settings.accountEmail
             ? 'Connected as ' + settings.accountEmail + '.'
@@ -719,11 +854,111 @@
           renderChecks('workModels', settings.workModels);
           renderChecks('employmentTypes', settings.employmentTypes);
           renderChecks('experienceLevels', settings.experienceLevels);
+          renderSignalTypes(settings.signalTypeGroups || []);
+          el('companySizes').innerHTML = '';
+          renderLabelledChecks(el('companySizes'), (settings.companySizes || []).map(function (size) {
+            return { value: size, label: size };
+          }));
           mountFilterBoxes();
         } else {
           beginSignIn();
         }
+        showView();
       }
+
+      // ── Hiring signals ───────────────────────────────────────────────────
+      /** Whether "only new" was offered last time the open tab was checked. */
+      var onlyNewOffered = false;
+
+      /**
+       * "Only new" is offered when the open tab is one this add-on wrote
+       * signals to, and ticked each time it appears. Checked when the view
+       * opens and whenever the sidebar gets focus, since the user may have
+       * switched tabs in between.
+       */
+      function refreshSignalsTab() {
+        serverCall('getSignalsTabStatus').then(function (status) {
+          var offered = Boolean(status && status.isSignalsTab);
+          if (offered && !onlyNewOffered) el('onlyNew').checked = true;
+          onlyNewOffered = offered;
+          el('onlyNewRow').style.display = offered ? 'block' : 'none';
+          if (offered) {
+            el('onlyNewHint').textContent = status.rows > 0
+              ? 'Adds to “' + status.name + '”, which holds ' + status.rows + ' signal' + (status.rows === 1 ? '' : 's') +
+                ', reading only what is newer. Use the same filters as before. Untick to import into a new tab.'
+              : 'Adds to “' + status.name + '”. Untick to import into a new tab.';
+          }
+        }).catch(function () { /* the import checks again */ });
+      }
+
+      window.addEventListener('focus', function () {
+        if (STATE && STATE.hasKey && VIEW === 'signals') refreshSignalsTab();
+      });
+
+      Array.prototype.forEach.call(document.querySelectorAll('[data-show-view]'), function (link) {
+        link.addEventListener('click', function () {
+          VIEW = link.getAttribute('data-show-view');
+          showView();
+        });
+      });
+
+      el('domainsFromSelection').addEventListener('click', function () {
+        var link = this;
+        link.disabled = true;
+        serverCall('getSelectedDomains')
+          .then(function (result) {
+            link.disabled = false;
+            var box = el('domains');
+            var have = box.value.split(/[\s,;]+/).map(function (d) { return d.toLowerCase(); });
+            var added = (result.domains || []).filter(function (d) { return have.indexOf(d) === -1; });
+            if (added.length > 0) box.value = (box.value.replace(/\s+$/, '') + '\n' + added.join('\n')).replace(/^\n/, '');
+            var message = added.length > 0
+              ? 'Added ' + added.length + ' domain' + (added.length === 1 ? '' : 's') + ' from the selection.'
+              : (result.domains || []).length > 0
+                ? 'The domains in the selection are already in the list.'
+                : 'Select the cells that hold the companies’ website domains, then try again.';
+            if (result.skipped > 0) {
+              message += ' ' + result.skipped + ' cell value' + (result.skipped === 1 ? ' is' : 's are') + ' not a domain and ' +
+                (result.skipped === 1 ? 'was' : 'were') + ' left out.';
+            }
+            setStatus(message, added.length > 0, 'signalsStatus');
+          })
+          .catch(function (err) {
+            link.disabled = false;
+            setStatus(err.message, false, 'signalsStatus');
+          });
+      });
+
+      el('runSignals').addEventListener('click', function () {
+        var button = this;
+        button.disabled = true;
+        el('signalsSpinner').className = 'spinner on';
+        el('signalsStatus').className = 'status';
+
+        serverCall('importSignals', {
+          domains: el('domains').value,
+          types: checked('signalTypes'),
+          countries: chipValues('signalCountries'),
+          companySizes: checked('companySizes'),
+          functions: chipValues('signalFunctions'),
+          minStrength: Number(el('minStrength').value || 0),
+          detectedAfter: el('detectedAfter').value || '',
+          excludeAgencies: el('excludeAgencies').checked,
+          onlyNew: onlyNewOffered && el('onlyNew').checked,
+          limit: Number(el('signalLimit').value || 50)
+        })
+          .then(function (result) {
+            button.disabled = false;
+            el('signalsSpinner').className = 'spinner';
+            setStatus(result.message, result.ok, 'signalsStatus');
+            refreshSignalsTab();
+          })
+          .catch(function (err) {
+            button.disabled = false;
+            el('signalsSpinner').className = 'spinner';
+            setStatus(err.message, false, 'signalsStatus');
+          });
+      });
 
       el('signIn').addEventListener('click', function (event) {
         if (!this.getAttribute('href')) {

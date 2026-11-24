@@ -1,6 +1,7 @@
 # Jobo for Sheets
 
-Google Sheets add-on that imports filtered Jobo job data into the active spreadsheet.
+Google Sheets add-on that imports filtered Jobo job data, and the hiring signals of a list of companies, into
+the active spreadsheet. Two menu items under **Extensions**: **Import jobs…** and **Import hiring signals…**.
 
 Full setup and filter docs: [jobo.world/docs/connectors/google-sheets](https://jobo.world/docs/connectors/google-sheets).
 
@@ -40,9 +41,10 @@ So `Code.ts` makes blocking `UrlFetchApp` calls. The retry decision still comes 
 asks the core's `isRetryable()` and `nextDelayMs()` whether to try again and how long to wait. That gives
 the add-on the core's rules:
 
-- The search (`POST /api/jobs/search`) bills every job it returns, so it is replayed only on a 429 or a 503
-  that carries `Retry-After`. After a dropped connection, a 500 or any other 5xx the charge may already
-  have been made, so the import stops there instead.
+- The search (`POST /api/jobs/search`) and the signals read (`GET /api/signals`) bill every job or signal
+  they return, so they are replayed only on a 429 or a 503 that carries `Retry-After`. After a dropped
+  connection, a 500 or any other 5xx the charge may already have been made, so the import stops there
+  instead.
 - A 503 without `Retry-After` ("Search took too long") is never retried, on any request: the same search
   runs out of time again.
 - The free requests (filter options, typeahead, occupations) are also retried after a dropped connection
@@ -54,15 +56,15 @@ It also shares the canonical filter values, the `Job` type, API key validation a
 
 ## Imports and Apps Script's 6-minute limit
 
-An Apps Script run is killed after 6 minutes. `importJobs()` writes each page to the sheet as it arrives
-(one `setValues` per page, header row with the first, then `SpreadsheetApp.flush()`), so a page that was
-billed is in the sheet before the next one is requested. It stops starting new pages, and skips any retry
-whose wait would end, after `IMPORT_TIME_BUDGET_MS` (4.5 minutes), and the message says how many jobs were
-written and that the import stopped early.
+An Apps Script run is killed after 6 minutes. `importJobs()` and `importSignals()` write each page to the
+sheet as it arrives (`sheetWriter()`: one `setValues` per page, header row with the first, then
+`SpreadsheetApp.flush()`), so a page that was billed is in the sheet before the next one is requested. They
+stop starting new pages, and skip any retry whose wait would end, after `IMPORT_TIME_BUDGET_MS` (4.5
+minutes), and the message says how many were written and that the import stopped early.
 
 ## Filters
 
-The sidebar covers connector-core's `JOB_SEARCH_FILTERS` (pinned `0.6.0`) except `posted_before`,
+The sidebar covers connector-core's `JOB_SEARCH_FILTERS` (pinned `0.8.0`) except `posted_before`,
 `discovered_after`, `discovered_before` (a one-shot import has no use for those windows) and
 `description_format` (no description column). `SHEETS_SUPPORTED_FILTER_KEYS` plus the drift-guard test in
 `Code.test.ts` keep that list honest.
@@ -81,6 +83,52 @@ used to re-fetch jobs already imported.
 
 `muteHttpExceptions: true` is load-bearing: without it Apps Script throws on any non-2xx and discards the
 response body, taking the problem details and the credit headers with it.
+
+## Hiring Signals
+
+**Import hiring signals…** opens the same sidebar as **Import jobs…**, on its signals view: one file, so the
+two share the connection (sign-in, key, Disconnect). `Sidebar.html` is an Apps Script template for this one
+value: `openSidebar()` prints the view into `data-view` on the body. Keep scriptlet tags out of the rest of
+the file and of the inlined `connector-ui` assets; a test checks the built file has exactly one.
+
+`importSignals()` reads `GET /api/signals` through the same `request()` as the job search, marked as billed
+(see above). connector-core's `JoboClient` and `pollSignals` are async and cannot run here; its pure helpers
+are used as they are: `toSignalsQuery()` builds the query (and refuses a value that contains a comma),
+`describeSignal()`, `signalTypeLabel()` and `signalStrengthBand()` fill the Summary, Signal and Strength band
+columns. A signal type the core does not know is written with its type in words.
+
+- **Filters sent** (`SHEETS_SIGNAL_FILTER_KEYS`, checked against `HIRING_SIGNAL_FILTERS` by a test):
+  `domains`, `types`, `countries`, `company_sizes`, `functions`, `min_strength`, `detected_after`,
+  `exclude_agencies`, and `created_after` for "only new". The focus filters beyond `functions`, the
+  thresholds and the funding filters stay in the dashboard and the API.
+- **Domains** are cleaned like `HiringSignalDomains.Normalize` on the server (`cleanDomains()`): scheme,
+  `www.`, path, user and port removed, lower-cased, de-duplicated. A typed value that is not a domain stops
+  the import before anything is read; from the selected cells (`getSelectedDomains()`) it is left out and
+  counted. Without domains, at least one of connector-core's `NARROWING_SIGNAL_FILTER_KEYS` must be set.
+- **More than 100 domains** are read in chunks of `SIGNAL_MAX_LIST_VALUES` (100), one after another. The
+  "how many" cap (1 to 1,000, default 50) counts signals *read*, which is what is billed, across all chunks;
+  each request asks for no more than is left of it, at most 200 a page, so an import never reads past it.
+- **Columns**: Detected, Company, Domain, Signal, Summary, Strength, Strength band, Country, Company size,
+  Industry, Funding stage, Functions, Role, Seniority, Topics, Job countries, Evidence job IDs, Created at,
+  Signal ID. Company size, Created at and Signal ID are set to plain text before they are written (Sheets
+  reads `1-10` as a date, and would round `created_at`).
+- **Only new** appends to the open tab when its header row starts with those headers (`readSignalsTab()`).
+  It reads the stored order (`sort=created_asc`, oldest first) with `created_after` set to the tab's newest
+  Created at, sent exactly as the tab holds it (`signalsReadBound()`). The API compares every decimal place,
+  and a signal that becomes readable later never has an earlier `created_at`, so nothing in the tab is read
+  again and nothing stored since is missed: there is no overlap and no waiting time. It needs an API that
+  has the stored order. A signals tab with no rows yet is read like a new tab.
+- An import into a new tab reads the newest detection day first, so one that stops early (cap, time,
+  failure) can leave signals behind that are older than the newest one it wrote, and a later "only new"
+  import never reads them. The message says so. An "only new" import that stops early is carried on exactly
+  by the next one, because it wrote everything stored up to its last row; the message says that instead. The
+  exception is more than 100 domains: the chunks are read one after another, so stopping early can leave a
+  later chunk's signals behind, and the first message is shown.
+- **Failures** (`describeSignalsFailure()`): 402 (nothing charged for that page), 403
+  `account_key_required`, 404 `not_available_in_sandbox`, 429 (with the rate limits without a subscription),
+  and a 400's first validation message.
+
+Each signal costs ten times a job; see the [guide](https://jobo.world/docs/guides/hiring-signals).
 
 ## Storage
 
@@ -151,8 +199,16 @@ messaging, query building, location formatting, sheet naming and the picker opti
 loop against a scripted fake of those services and a fake clock (the exact search body every filter
 produces, equal page sizes, API warnings in the message, each page written before the next is requested,
 the time budget, which failures are retried, and a failed later page keeping the pages already billed).
-They also check the built `dist/` (the manifest, and the shared UI inlined verbatim). Everything else
-needs a real deployment and a `jbe_test_` key.
+The signals import is covered the same way: domain cleaning, the query (chunks of 100 sharing one cap,
+cursor paging), the rows and their plain-text columns, both "only new" modes, the result message and each
+error message. They also check the built `dist/` (the manifest and its three scopes, the shared UI inlined
+verbatim, and the sidebar's one scriptlet). Everything else needs a real deployment and a live key: a
+`jbe_test_` key cannot read signals.
+
+Not proven outside the fakes: `HtmlService.createTemplateFromFile` evaluating the whole sidebar with the
+inlined combobox; `setNumberFormat("@")` keeping a seven-decimal `created_at` exactly as text;
+`getActiveRange()` and `getActiveSheet()` from a sidebar call returning what the user has selected and
+open; and the signals view's markup and script, which no test runs.
 
 Sign in with Jobo is covered against scripted fakes only: the authorization URL, the challenge for a known
 verifier, self-registration, and every outcome of the callback. It has never run in Apps Script. To check
